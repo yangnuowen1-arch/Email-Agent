@@ -3,7 +3,9 @@ name = "email-agent"
 version = "0.1.0"
 description = "A minimal, extensible Python starter for building an email agent."
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "pydantic-settings>=2.15.0",
+]
 
 [project.scripts]
 email-agent = "email_agent.main:main"
@@ -11,3 +13,8 @@ email-agent = "email_agent.main:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
