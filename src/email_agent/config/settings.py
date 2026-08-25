@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 
 from dotenv import load_dotenv
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def _parse_int(name: str, raw: str | None, default: int) -> int:
@@ -96,3 +98,21 @@ class AppConfig:
             sync_timeout_seconds=sync_timeout_seconds,
             log_level=log_level,
         )
+
+
+class Settings(BaseSettings):
+    """LLM 智能体运行时配置（预留骨架），由环境变量/.env 驱动。"""
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    app_name: str = "email-agent"
+
+    log_level: str = "INFO"
+
+    openai_api_key: str | None = None
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """返回进程内唯一缓存的 Settings 实例。"""
+    return Settings()

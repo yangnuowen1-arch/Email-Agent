@@ -1,12 +1,10 @@
 [project]
 name = "email-agent"
 version = "0.1.0"
-description = "从 PostgreSQL 读取邮件账号配置，按账号并发拉取邮件并解析入库"
-readme = "README.md"
+description = "A minimal, extensible Python starter for building an email agent."
 requires-python = ">=3.11"
-license = { text = "MIT" }
-authors = [{ name = "Email-Agent" }]
 dependencies = [
+    "pydantic-settings>=2.15.0",
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.1",
     "IMAPClient>=3.0",
@@ -26,6 +24,10 @@ email-agent = "email_agent.cli.main:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
 [tool.hatch.build.targets.wheel]
 packages = ["src/email_agent"]
 

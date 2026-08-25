@@ -33,7 +33,7 @@ PG(email_accounts) → MailClient 抽象层(IMAP) → 解析(parsing) → PG(ema
 
 ```
 src/email_agent/
-├── config/            # AppConfig：环境变量加载，缺参时报错清晰
+├── config/            # AppConfig（同步任务）+ Settings/get_settings（LLM 骨架）：环境变量加载，缺参时报错清晰
 ├── models/            # Account / EmailMessage 等 ORM 模型（声明式，兼领域契约）
 │   ├── base.py        #   DeclarativeBase 基类
 │   ├── account.py     #   Account：email_accounts 表映射 + 字段校验
@@ -50,7 +50,12 @@ src/email_agent/
 ├── parsing/           # 原始 RFC822 字节 → EmailMessage，纯函数
 ├── service/           # 业务编排：单账号流程 + 并发调度 + 失败隔离
 ├── bootstrap.py       # 组合根：装配 config/engine/repository，CLI 唯一粘合点
-└── cli/               # 入口 python -m email_agent
+├── cli/               # 正式入口 python -m email_agent / email-agent 命令
+├── agent/             # LLM 智能体预留骨架：demo 入口 python -m email_agent.agent（本地无网络演示）
+├── llm/               # LLM 客户端抽象（EchoLLMClient 占位实现，待接真实 provider）
+├── memory/            # 记忆模块占位（空骨架）
+└── tools/             # 工具集占位（search 等，稳定接口待接入真实 provider）
+
 tests/
 ├── unit/              # 与 src 包结构镜像对应（Session 以 MagicMock 注入）
 └── integration/       # 需要真实 PG 的测试（真实 Session + 幂等/事务验证）

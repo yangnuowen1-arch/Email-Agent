@@ -1,11 +1,27 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from types import TracebackType
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from email_agent.models.account import Account
+
+@dataclass(frozen=True)
+class AccountConfig:
+    """邮件客户端所需的账号连接信息，本包自包含的数据契约。
+
+    字段与 ORM 的 ``Account`` 同名同义：真实 ORM 实例鸭子类型兼容，
+    可直接传入，无需在本包内反向依赖 models 层。
+    """
+
+    name: str
+    host: str
+    username: str
+    password: str
+
+    port: int = 993
+    protocol: str = "imap"
+    use_ssl: bool = True
+    folder: str = "INBOX"
 
 
 class MailClientError(Exception):
@@ -26,9 +42,9 @@ class MailClient(ABC):
     ``with create_client(account) as client:`` 的上下文管理写法。
     """
 
-    def __init__(self, account: Account) -> None:
-        # 绑定账号配置，后续所有操作都围绕该账号进行
-        self.account: Account = account
+    def __init__(self, account: AccountConfig) -> None:
+        # 原样保存传入对象：保持与调用方同一实例，便于断言与字段复用
+        self.account: AccountConfig = account
 
     @abstractmethod
     def connect(self) -> None:
@@ -69,11 +85,12 @@ class MailClient(ABC):
     ) -> bool:
         try:
             self.close()
+
         except Exception:
-            # 关闭时的异常不应掩盖原始异常
-            # 如果上下文内已发生异常（exc_type 非 None），则吞掉 close 的异常
-            # 否则（正常退出但 close 失败）需抛出，让调用方感知资源释放失败
+            # close 失败不能掩盖上下文内的原始异常；
+            # 但正常退出路径上必须抛出，让调用方感知资源释放失败
             if exc_type is None:
                 raise
+
         # 返回 False 表示不吞掉原始异常，交由外层处理
         return False
