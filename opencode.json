@@ -19,5 +19,16 @@
       "git log *": "allow"
     }
   },
-  "lsp": true
+  "lsp": true,
+  "mcp": {
+    "postgres": {
+      "type": "local",
+      "command": ["npx", "-y", "@sigma4life/postgres-mcp-server"],
+      "enabled": true,
+      "environment": {
+        "DATABASE_URL": "postgresql://admin:123456@192.168.31.25:5432/email_agent",
+        "SCHEMA_ONLY_MODE": "true"
+      }
+    }
+  }
 }
