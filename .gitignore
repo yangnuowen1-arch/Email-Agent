@@ -226,3 +226,6 @@ __marimo__/
 .env
 .claude
 .opencode/
+
+.DS_Store
+opencode.json
