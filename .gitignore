@@ -228,4 +228,4 @@ __marimo__/
 .opencode/
 
 .DS_Store
-opencode.json
+opencode.json.DS_Store
