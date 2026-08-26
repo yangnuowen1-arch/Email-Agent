@@ -5,15 +5,19 @@ description = "A minimal, extensible Python starter for building an email agent.
 requires-python = ">=3.11"
 dependencies = [
     "pydantic-settings>=2.15.0",
-    "sqlalchemy>=2.0",
+    "sqlalchemy[asyncio]>=2.0",
     "psycopg[binary]>=3.1",
     "IMAPClient>=3.0",
     "python-dotenv>=1.0",
+    "typer>=0.27.1",
+    "structlog>=25.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=1.0",
+    "aiosqlite>=0.20",
     "ruff>=0.8",
 ]
 
@@ -27,7 +31,10 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.0",
+    "aiosqlite>=0.20",
 ]
+
 [tool.hatch.build.targets.wheel]
 packages = ["backend/app"]
 
@@ -50,6 +57,7 @@ quote-style = "double"
 testpaths = ["tests"]
 pythonpath = ["backend"]
 addopts = "-q"
+asyncio_mode = "auto"
 
 [tool.coverage.run]
 source = ["app"]

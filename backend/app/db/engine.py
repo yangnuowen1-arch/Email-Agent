@@ -1,72 +1,65 @@
+"""异步数据库门面：Database 对象装配与事务边界管理。
+
+设计约束：引擎/会话工厂不设模块级全局单例，生命周期一律由
+``app.core.container.Container`` 持有并在退出时统一释放。
+"""
+
 from __future__ import annotations
 
-import threading
-from typing import TYPE_CHECKING
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
-from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
-if TYPE_CHECKING:
-    from app.core.settings import AppConfig
-
-# 全局引擎单例，多线程间共享
-_engine: Engine | None = None
-# 保护引擎初始化/关闭的互斥锁，避免并发创建多个引擎
-_lock = threading.Lock()
-
-
-def init_engine(config: AppConfig) -> Engine:
-    """初始化全局 SQLAlchemy 引擎（自带连接池，使用 psycopg v3 驱动）。
-
-    连接串须为 ``postgresql+psycopg://`` 形式（见 ``.env.example``）。
-    """
-    global _engine
-    # 加锁保证多线程同时调用 init_engine 时只有一个能创建引擎
-    with _lock:
-        # 如果已存在旧引擎，先释放其连接，避免泄漏
-        if _engine is not None:
-            _engine.dispose()
-            _engine = None
-        try:
-            # 引擎内置连接池：pool_size 对应原 maxconn 上限，
-            # max_overflow=0 使连接数硬上限等于 pool_size（与原 ThreadedConnectionPool 语义一致）
-            # pool_pre_ping 在借出连接时做一次健康检查，自动丢弃失效连接
-            _engine = create_engine(
-                config.database_url,
-                pool_size=config.db_pool_max_size,
-                max_overflow=0,
-                pool_pre_ping=True,
-                future=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            # 初始化失败时包装为 RuntimeError，带上原始异常便于排查连接串/网络问题
-            raise RuntimeError(f"failed to init DB engine: {exc}") from exc
-        return _engine
+# 导入模型包即把所有表注册进 Base.metadata，create_all 才能建全
+import app.db.db  # noqa: F401
+from app.core.settings import AppConfig
 
 
-def get_engine() -> Engine:
-    """获取已初始化的引擎，未初始化则报错。"""
-    if _engine is None:
-        # 防御性检查，避免在未调用 init_engine 前就尝试获取连接
-        msg = "DB engine not initialized; call init_engine(config) first"
-        raise RuntimeError(msg)
-    return _engine
+@dataclass(slots=True)
+class Database:
+    """异步数据库门面：持有引擎与会话工厂，事务边界由 session() 独占管理。"""
 
+    engine: AsyncEngine
+    sessions: async_sessionmaker[AsyncSession]
 
-def get_session_factory() -> sessionmaker[Session]:
-    """获取绑定到引擎的会话工厂，调用即得到一个新 Session（独占连接）。"""
-    # expire_on_commit=False：提交后已加载的对象属性仍可读，避免跨线程传值时意外触发懒加载
-    return sessionmaker(bind=get_engine(), expire_on_commit=False, future=True)
+    @asynccontextmanager
+    async def session(self) -> AsyncIterator[AsyncSession]:
+        """提供一个事务性会话：正常退出即提交，异常即回滚并透传。
 
-
-def close_engine() -> None:
-    """释放引擎及其所有连接，通常在程序退出时调用。"""
-    global _engine
-    with _lock:
-        if _engine is not None:
+        commit/rollback 只在这里发生；repository 层用 flush() 取主键，
+        禁止手动提交，保证一个上下文就是一个原子事务单元。
+        """
+        async with self.sessions() as session:
             try:
-                _engine.dispose()
-            finally:
-                # 无论关闭是否成功，都将全局引用置空，避免后续误用已关闭的引擎
-                _engine = None
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
+    async def dispose(self) -> None:
+        """释放底层引擎的连接池；由容器 ``close_all`` 统一调用。"""
+        await self.engine.dispose()
+
+def build_database(config: AppConfig) -> Database:
+    """按配置装配 Database。
+
+    连接池沿用既有语义：pool_size 对应 DB_POOL_MAX_SIZE 硬上限
+    （max_overflow=0），pool_pre_ping 借出前做健康检查丢弃失效连接。
+    引擎创建不产生任何网络 I/O，连接在首次借出时才真正建立。
+    """
+    engine = create_async_engine(
+        config.database_url,
+        pool_size=config.db_pool_max_size,
+        max_overflow=0,
+        pool_pre_ping=True,
+    )
+
+    return Database(engine=engine, sessions=async_sessionmaker(engine, expire_on_commit=False))

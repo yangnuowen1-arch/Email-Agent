@@ -31,7 +31,9 @@ CREATE TABLE email_accounts (
     folder        TEXT NOT NULL DEFAULT 'INBOX',
     enabled       BOOL NOT NULL DEFAULT TRUE,
     last_sync_uid BIGINT NOT NULL DEFAULT 0,
-    last_sync_at  TIMESTAMPTZ
+    last_sync_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 COMMENT ON TABLE email_accounts IS '邮箱账号配置表（程序输入源）';
@@ -47,6 +49,8 @@ COMMENT ON COLUMN email_accounts.folder IS '要拉取的邮箱文件夹';
 COMMENT ON COLUMN email_accounts.enabled IS '软开关：FALSE 的账号不会被调度';
 COMMENT ON COLUMN email_accounts.last_sync_uid IS '增量断点：已成功入库的最大 UID；0 表示从未同步（首跑全量）';
 COMMENT ON COLUMN email_accounts.last_sync_at IS '最近一次成功同步时间，仅运维观测用';
+COMMENT ON COLUMN email_accounts.created_at IS '创建时间';
+COMMENT ON COLUMN email_accounts.updated_at IS '最后更新时间';
 ```
 
 | 字段 | 类型 | 约束 | 说明 |
@@ -63,6 +67,8 @@ COMMENT ON COLUMN email_accounts.last_sync_at IS '最近一次成功同步时间
 | enabled | BOOL | NOT NULL, DEFAULT TRUE | 软开关：FALSE 的账号不会被调度 |
 | last_sync_uid | BIGINT | NOT NULL, DEFAULT 0 | **增量断点**：已成功入库的最大 UID；0 表示从未同步（首跑全量） |
 | last_sync_at | TIMESTAMPTZ | 可空 | 最近一次成功同步时间，仅运维观测用 |
+| created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 创建时间（UTC），插入后不可变 |
+| updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 最后更新时间（UTC），随行更新刷新 |
 
 例子: INSERT INTO email_accounts (name, host, username, password) VALUES ('xxx@qq.com','imap.qq.com','xxx@qq.com','xxxx授权码') RETURNING id;
 
@@ -71,7 +77,7 @@ COMMENT ON COLUMN email_accounts.last_sync_at IS '最近一次成功同步时间
 ```sql
 CREATE TABLE emails (
     id          SERIAL PRIMARY KEY,
-    account_id  INT REFERENCES email_accounts(id),
+    account_id  INT NOT NULL,
     uid         BIGINT NOT NULL,
     message_id  TEXT,
     subject     TEXT,
@@ -81,12 +87,14 @@ CREATE TABLE emails (
     text_body   TEXT,
     html_body   TEXT,
     fetched_at  TIMESTAMPTZ DEFAULT now(),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (account_id, uid)
 );
 
 COMMENT ON TABLE emails IS '已拉取邮件表（程序输出）';
 COMMENT ON COLUMN emails.id IS '自增主键';
-COMMENT ON COLUMN emails.account_id IS '所属账号，外键 → email_accounts.id';
+COMMENT ON COLUMN emails.account_id IS '所属账号，逻辑外键 → email_accounts.id（无物理外键约束）';
 COMMENT ON COLUMN emails.uid IS '邮箱服务器内该文件夹下的 UID，与 account_id 组成幂等键';
 COMMENT ON COLUMN emails.message_id IS 'RFC822 Message-ID 头，便于跨系统追溯去重';
 COMMENT ON COLUMN emails.subject IS '已解码的主题；解析失败存空串而非 NULL 报错';
@@ -96,12 +104,14 @@ COMMENT ON COLUMN emails.sent_at IS '邮件 Date 头解析结果';
 COMMENT ON COLUMN emails.text_body IS '纯文本正文';
 COMMENT ON COLUMN emails.html_body IS 'HTML 正文；与 text_body 至少一个非空';
 COMMENT ON COLUMN emails.fetched_at IS '本地拉取时间';
+COMMENT ON COLUMN emails.created_at IS '创建时间（UTC），插入后不可变';
+COMMENT ON COLUMN emails.updated_at IS '最后更新时间（UTC），随行更新刷新';
 ```
 
 | 字段 | 类型 | 约束 | 说明 |
 |---|---|---|---|
 | id | SERIAL | PK | 自增主键 |
-| account_id | INT | FK → email_accounts.id | 所属账号 |
+| account_id | INT | NOT NULL，逻辑外键 → email_accounts.id（无物理外键约束） | 所属账号 |
 | uid | BIGINT | NOT NULL | 邮箱服务器内该文件夹下的 UID，与 account_id 组成幂等键 |
 | message_id | TEXT | 可空 | RFC822 Message-ID 头，便于跨系统追溯去重 |
 | subject | TEXT | 可空 | 已解码的主题；解析失败存空串而非 NULL 报错 |
@@ -111,6 +121,8 @@ COMMENT ON COLUMN emails.fetched_at IS '本地拉取时间';
 | text_body | TEXT | 可空 | 纯文本正文 |
 | html_body | TEXT | 可空 | HTML 正文；与 text_body 至少一个非空 |
 | fetched_at | TIMESTAMPTZ | DEFAULT now() | 本地拉取时间 |
+| created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 创建时间（UTC），插入后不可变 |
+| updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 最后更新时间（UTC），随行更新刷新 |
 
 写入方式：批量 `INSERT ... ON CONFLICT (account_id, uid) DO NOTHING`。
 

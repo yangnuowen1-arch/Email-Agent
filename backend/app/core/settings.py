@@ -86,10 +86,10 @@ class AppConfig:
         sync_timeout_seconds = _parse_int(
             "SYNC_TIMEOUT_SECONDS", os.getenv("SYNC_TIMEOUT_SECONDS"), 60
         )
+
         # 日志级别统一转大写，空值回退到 INFO，避免大小写敏感导致配置不生效
         log_level = (os.getenv("LOG_LEVEL", "INFO") or "INFO").strip().upper() or "INFO"
 
-        # 组装不可变配置对象，__post_init__ 会再次做范围校验
         return cls(
             database_url=database_url,
             db_pool_min_size=db_pool_min_size,

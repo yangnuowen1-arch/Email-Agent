@@ -1,14 +1,14 @@
-# 数据库引擎/会话工厂对外导出，统一从此模块导入
-from app.db.engine import (
-    close_engine,  # 关闭引擎并释放所有连接，程序退出时调用
-    get_engine,  # 获取已初始化的引擎
-    get_session_factory,  # 获取绑定引擎的会话工厂
-    init_engine,  # 初始化引擎（含连接池）
-)
+# 数据库门面对外导出，统一从此模块导入；生命周期由 core.container 管理
+from app.db.db import Account, Base, EmailMessage
+from app.db.engine import Database, build_database
+from app.db.repositories import EmailAccountRepository, EmailRepository
 
 __all__ = [
-    "close_engine",
-    "get_engine",
-    "get_session_factory",
-    "init_engine",
+    "Account",
+    "Base",
+    "Database",
+    "EmailAccountRepository",
+    "EmailMessage",
+    "EmailRepository",
+    "build_database",
 ]

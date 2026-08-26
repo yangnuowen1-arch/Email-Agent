@@ -32,6 +32,5 @@ def test_cli_help_exits_zero() -> None:
 
     assert result.returncode == 0
 
-    assert "--limit" in result.stdout
-
-    assert "--full" in result.stdout
+    # 新设计：无 CLI 参数，同步能力以子命令暴露
+    assert "ingest" in result.stdout
