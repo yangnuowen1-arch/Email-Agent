@@ -3,13 +3,11 @@
 from app.schemas.account import AccountConfig
 from app.schemas.email import (
     ParsedEmail,
-    AccountSpec,
     AccountResult,
     BatchResult,
+    AccountSpec,
     EmailData,
-    RawEmail,
+RawEmail,
 )
 
-__all__ = ["AccountConfig", "ParsedEmail"]
-
-__all__ = ["AccountConfig", "ParsedEmail", "AccountSpec", "RawEmail", "EmailData", "AccountResult", "BatchResult"]
+__all__ = ["AccountConfig", "ParsedEmail",  "AccountResult", "BatchResult", "AccountSpec", "RawEmail"]

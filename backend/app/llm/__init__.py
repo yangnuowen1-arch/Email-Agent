@@ -1,5 +1,20 @@
-"""LLM client interfaces and local development implementations."""
+"""LLM gateway interfaces and concrete implementations."""
 
-from .client import EchoLLMClient, LLMClient, LLMResponse
+from .base import (
+    ChatResponse,
+    LLMConfigurationError,
+    LLMError,
+    LLMGateway,
+    ToolCall,
+)
+from .gateway import OpenAIGateway, build_llm_gateway
 
-__all__ = ["EchoLLMClient", "LLMClient", "LLMResponse"]
+__all__ = [
+    "ChatResponse",
+    "LLMConfigurationError",
+    "LLMError",
+    "LLMGateway",
+    "ToolCall",
+    "OpenAIGateway",
+    "build_llm_gateway",
+]

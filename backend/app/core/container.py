@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import structlog
 
+from app.agent import EmailAgent
 from app.core.ingest import IngestCoordinator
-from app.core.settings import AppConfig
+from app.core.settings import AppConfig, get_llm_config
 from app.db.engine import Database, build_database
 from app.observability import configure_logging
 from app.services.email import EmailService
@@ -38,6 +39,9 @@ class Container:
             config=self._config,
         )
 
+        # EmailAgent 延迟到首次访问时构建，避免无 LLM_API_KEY 时影响 ingest 等既有流程
+        self._agent: EmailAgent | None = None
+
     @property
     def config(self) -> AppConfig:
         """返回全局配置，CLI 与业务层据此读取环境变量驱动的参数。"""
@@ -57,6 +61,13 @@ class Container:
     def coordinator(self) -> IngestCoordinator:
         """返回邮件同步编排器实例。"""
         return self._coordinator
+
+    @property
+    def agent(self) -> EmailAgent:
+        """返回邮件智能体门面；首次访问时按 LLM 配置构建并缓存。"""
+        if self._agent is None:
+            self._agent = EmailAgent(get_llm_config())
+        return self._agent
 
     @property
     def logger(self):

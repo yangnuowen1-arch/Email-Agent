@@ -1,5 +1,5 @@
 """Agent orchestration primitives."""
 
-from .core import EmailAgent
+from .graph import EmailAgent
 
 __all__ = ["EmailAgent"]

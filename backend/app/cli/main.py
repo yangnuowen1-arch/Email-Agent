@@ -25,7 +25,7 @@ def cli(ctx: typer.Context) -> None:
     try:
         container = Container(config)
     except Exception as exc:
-        typer.echo(f"failed to init DB engine: {exc}", err=True)
+        typer.echo(f"failed to initialize container: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
     container.logger.info(
@@ -35,6 +35,14 @@ def cli(ctx: typer.Context) -> None:
         db_pool_max=config.db_pool_max_size,
     )
     ctx.obj = container
+
+
+@app.command()
+def agent(ctx: typer.Context, task: str = typer.Argument(...)) -> None:
+    """联调：把任务交给容器中的 EmailAgent，打印 LLM 回复。"""
+    container: Container = ctx.obj
+    response = asyncio.run(container.agent.respond(task))
+    typer.echo(response.content)
 
 
 @app.command()

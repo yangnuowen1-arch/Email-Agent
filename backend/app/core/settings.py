@@ -100,7 +100,7 @@ class AppConfig:
         )
 
 
-class Settings(BaseSettings):
+class LLMConfig(BaseSettings):
     """LLM 智能体运行时配置（预留骨架），由环境变量/.env 驱动。"""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -109,10 +109,17 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
-    openai_api_key: str | None = None
+    # LLM 智能体运行配置（OpenAI 兼容网关）
+    llm_provider: str = "openai"
+    llm_model: str = "gpt-4o-mini"
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_api_key: str | None = None
+    llm_temperature: float = 0.2
+    llm_max_tokens: int = 4096
+    llm_timeout_seconds: int = 120
 
 
 @lru_cache
-def get_settings() -> Settings:
-    """返回进程内唯一缓存的 Settings 实例。"""
-    return Settings()
+def get_llm_config() -> LLMConfig:
+    """返回进程内唯一缓存的 LLMConfig 实例。"""
+    return LLMConfig()
