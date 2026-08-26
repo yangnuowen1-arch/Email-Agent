@@ -222,3 +222,5 @@ __marimo__/
 .lsp/
 .venv/
 ..mypy_cache/
+
+.env
