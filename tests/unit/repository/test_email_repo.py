@@ -4,8 +4,8 @@ from unittest.mock import MagicMock
 import pytest
 from sqlalchemy.dialects import postgresql
 
-from app.models.message import EmailMessage
 from app.repository.emails import EmailStore
+from app.schemas.email import ParsedEmail
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def test_bulk_insert_builds_on_conflict_do_nothing(session):
     store = EmailStore(session)
     now = datetime.now(UTC)
     msgs = [
-        EmailMessage(
+        ParsedEmail(
             account_id=1,
             uid=100,
             message_id="<m1@x>",
@@ -36,9 +36,8 @@ def test_bulk_insert_builds_on_conflict_do_nothing(session):
             sent_at=now,
             text_body="ta",
             html_body="<p>a</p>",
-            fetched_at=now,
         ),
-        EmailMessage(account_id=1, uid=101, subject="b"),
+        ParsedEmail(account_id=1, uid=101, subject="b"),
     ]
     n = store.bulk_insert(msgs)
     assert n == 2
@@ -51,9 +50,9 @@ def test_bulk_insert_builds_on_conflict_do_nothing(session):
     assert "account_id" in sql and "uid" in sql
 
 
-def test_bulk_insert_uses_default_fetched_at(session):
+def test_bulk_insert_fills_fetched_at(session):
     store = EmailStore(session)
-    msg = EmailMessage(account_id=1, uid=100, subject="a")
+    msg = ParsedEmail(account_id=1, uid=100, subject="a")
     store.bulk_insert([msg])
     # 提交的字典中应填充 fetched_at（非 None）
     values = session.execute.call_args[0][0]
@@ -64,13 +63,13 @@ def test_bulk_insert_uses_default_fetched_at(session):
 
 def test_bulk_insert_type_error_for_non_model(session):
     store = EmailStore(session)
-    with pytest.raises(TypeError, match="EmailMessage"):
+    with pytest.raises(TypeError, match="ParsedEmail"):
         store.bulk_insert(["not a message"])  # type: ignore[list-item]
 
 
 def test_bulk_insert_wraps_db_error(session):
     session.execute.side_effect = Exception("boom")
     store = EmailStore(session)
-    msg = EmailMessage(account_id=1, uid=100, subject="a")
+    msg = ParsedEmail(account_id=1, uid=100, subject="a")
     with pytest.raises(RuntimeError, match="failed to bulk insert"):
         store.bulk_insert([msg])

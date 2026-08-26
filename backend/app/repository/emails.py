@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models.message import EmailMessage
-
-if TYPE_CHECKING:
-    pass
+from app.schemas.email import ParsedEmail
 
 
 class EmailStore:
@@ -17,13 +14,15 @@ class EmailStore:
 
     批量写入使用 PostgreSQL 的 ``INSERT ... ON CONFLICT DO NOTHING``
     实现幂等，重复执行不会产生重复数据。
+
+    ``ParsedEmail`` → ``emails`` 表列的映射只发生在本类内部。
     """
 
     def __init__(self, session: Session) -> None:
         # 绑定调用方提供的 Session（与 AccountStore 共享，保证事务原子性）
         self._s = session
 
-    def bulk_insert(self, messages: list[EmailMessage]) -> int:
+    def bulk_insert(self, messages: list[ParsedEmail]) -> int:
         """批量插入邮件，利用幂等键去重，返回实际插入的行数。"""
         # 空列表直接返回，避免执行无意义的 SQL
         if not messages:
@@ -32,12 +31,10 @@ class EmailStore:
         # 组装批量插入的值列表，每行对应一封邮件的字段
         values: list[dict] = []
         for m in messages:
-            # 类型检查，确保调用方传入的是领域模型，而非原始字典
-            if not isinstance(m, EmailMessage):
-                msg = f"expected EmailMessage, got {type(m).__name__}"
+            # 类型检查，确保调用方传入的是领域契约，而非 ORM 实例或原始字典
+            if not isinstance(m, ParsedEmail):
+                msg = f"expected ParsedEmail, got {type(m).__name__}"
                 raise TypeError(msg)
-            # fetched_at 若为空则補为当前时间，保证入库时间可追溯
-            fetched_at = m.fetched_at or datetime.now(UTC)
             values.append(
                 {
                     "account_id": m.account_id,
@@ -49,7 +46,8 @@ class EmailStore:
                     "sent_at": m.sent_at,
                     "text_body": m.text_body,
                     "html_body": m.html_body,
-                    "fetched_at": fetched_at,
+                    # 入库时间由持久化层决定，契约不携带该字段
+                    "fetched_at": datetime.now(UTC),
                 }
             )
 

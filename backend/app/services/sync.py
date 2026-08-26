@@ -15,10 +15,25 @@ from app.providers.email.base import MailClientError
 from app.providers.email.factory import create_client
 from app.repository.email_accounts import AccountStore
 from app.repository.emails import EmailStore
+from app.schemas.account import AccountConfig
 from app.services.parsing import parse_email
 
 # 模块级日志记录器，用于记录解析失败、同步失败等信息
 logger = logging.getLogger(__name__)
+
+
+def _to_config(account: Account) -> AccountConfig:
+    """将 ORM 账号投影为连接配置，使 providers 层不接触持久化模型。"""
+    return AccountConfig(
+        name=account.name,
+        host=account.host,
+        username=account.username,
+        password=account.password,
+        port=account.port,
+        protocol=account.protocol,
+        use_ssl=account.use_ssl,
+        folder=account.folder,
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -47,7 +62,7 @@ def sync_account(
     session: Any,
     email_store: EmailStore,
     checkpoint_store: AccountStore,
-    client_factory: Callable[[Account], Any] = create_client,
+    client_factory: Callable[[AccountConfig], Any] = create_client,
     parser: Callable[[bytes, int, int], Any] = parse_email,
     limit: int | None = None,
     full: bool = False,
@@ -80,8 +95,8 @@ def sync_account(
         # 确定增量起点：full 模式强制从 0 开始（全量），否则从上次断点继续
         since_uid = 0 if full else account.last_sync_uid
 
-        # 创建并连接邮件客户端，client_factory 默认为 create_client，测试可注入 Fake
-        client = client_factory(account)
+        # 创建并连接邮件客户端，只传入不可变连接配置，不泄露 ORM 实例
+        client = client_factory(_to_config(account))
         client.connect()  # type: ignore[union-attr]
 
         # 拉取原始邮件，folder 和 since_uid 决定增量范围，limit 控制调试时的截断
@@ -193,7 +208,7 @@ def sync_all(
     timeout: float | int | None,
     limit: int | None = None,
     full: bool = False,
-    client_factory: Callable[[Account], Any] = create_client,
+    client_factory: Callable[[AccountConfig], Any] = create_client,
     parser: Callable[[bytes, int, int], Any] = parse_email,
     now: datetime | None = None,
 ) -> list[SyncResult]:

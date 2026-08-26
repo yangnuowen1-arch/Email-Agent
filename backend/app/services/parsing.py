@@ -6,7 +6,7 @@ from email.header import decode_header
 from email.message import EmailMessage as StdEmailMessage
 from email.utils import getaddresses, parsedate_to_datetime
 
-from app.models.message import EmailMessage
+from app.schemas.email import ParsedEmail
 
 
 def _decode_subject(msg: StdEmailMessage) -> str:
@@ -214,10 +214,10 @@ def _extract_bodies(msg: StdEmailMessage) -> tuple[str | None, str | None]:
     return text_body, html_body
 
 
-def parse_email(raw: bytes, account_id: int, uid: int) -> EmailMessage:
-    """将原始 RFC822 字节解析为领域模型 :class:`EmailMessage`。
+def parse_email(raw: bytes, account_id: int, uid: int) -> ParsedEmail:
+    """将原始 RFC822 字节解析为领域契约 :class:`ParsedEmail`。
 
-    纯函数：无 I/O、无全局状态，便于单测和并发调用。
+    纯函数：无 I/O、无全局状态、不依赖 ORM，便于单测和并发调用。
 
     Args:
         raw: 完整 RFC822 消息字节，可能为空。
@@ -225,8 +225,8 @@ def parse_email(raw: bytes, account_id: int, uid: int) -> EmailMessage:
         uid: IMAP UID，原样存储。
 
     Returns:
-        填充好各字段的 :class:`EmailMessage`；缺失的可选头按模型默认值
-        变为 ``None``/``""``/``[]``，保证下游入库不报错。
+        填充好各字段的 :class:`ParsedEmail`；缺失的可选头变为
+        ``None``/``""``/``[]``，保证下游入库不报错。
     """
 
     # 校验核心参数，防止非法值污染数据库
@@ -239,34 +239,14 @@ def parse_email(raw: bytes, account_id: int, uid: int) -> EmailMessage:
 
     # 空字节直接返回默认值，符合规范中“空邮件容错”的约定
     if not raw:
-        return EmailMessage(
-            account_id=account_id,
-            uid=uid,
-            message_id=None,
-            subject="",
-            sender=None,
-            recipients=[],
-            sent_at=None,
-            text_body=None,
-            html_body=None,
-        )
+        return ParsedEmail(account_id=account_id, uid=uid)
 
     try:
         # 使用 policy=default 解析，确保得到结构化的 EmailMessage 对象
         emsg = email.message_from_bytes(raw, policy=policy.default)
     except Exception:
         # 解析完全失败时返回默认值，避免整批同步因单封邮件异常而中断
-        return EmailMessage(
-            account_id=account_id,
-            uid=uid,
-            message_id=None,
-            subject="",
-            sender=None,
-            recipients=[],
-            sent_at=None,
-            text_body=None,
-            html_body=None,
-        )
+        return ParsedEmail(account_id=account_id, uid=uid)
 
     # 依次提取各字段，每步均有容错逻辑
     subject = _decode_subject(emsg)
@@ -281,8 +261,8 @@ def parse_email(raw: bytes, account_id: int, uid: int) -> EmailMessage:
 
     text_body, html_body = _extract_bodies(emsg)
 
-    # 组装领域模型返回
-    return EmailMessage(
+    # 组装领域契约返回
+    return ParsedEmail(
         account_id=account_id,
         uid=uid,
         message_id=message_id,

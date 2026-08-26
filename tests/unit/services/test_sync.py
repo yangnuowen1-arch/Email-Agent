@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.models.account import Account
-from app.models.message import EmailMessage
 from app.providers.email.base import MailClient, MailClientError
+from app.schemas.email import ParsedEmail
 from app.services.sync import sync_account, sync_all
 
 
@@ -81,7 +81,7 @@ def test_sync_account_full_flow_inserts_and_updates_state():
         return FakeMailClient(a, uids_to_return=[11, 12])
 
     def parser(raw, account_id, uid):
-        return EmailMessage(account_id=account_id, uid=uid, subject=f"s{uid}")
+        return ParsedEmail(account_id=account_id, uid=uid, subject=f"s{uid}")
 
     result = sync_account(
         acc,
@@ -204,7 +204,7 @@ def test_sync_account_bulk_insert_conflict_skips():
         return FakeMailClient(a, uids_to_return=[1, 2])
 
     def parser(raw, account_id, uid):
-        return EmailMessage(account_id=account_id, uid=uid)
+        return ParsedEmail(account_id=account_id, uid=uid)
 
     result = sync_account(
         acc,
@@ -257,7 +257,7 @@ def test_sync_account_parser_exception_skipped():
     def parser(raw, account_id, uid):
         if uid == 1:
             raise ValueError("bad raw")
-        return EmailMessage(account_id=account_id, uid=uid)
+        return ParsedEmail(account_id=account_id, uid=uid)
 
     result = sync_account(
         acc,
@@ -286,7 +286,7 @@ def test_sync_account_atomic_rollback_on_checkpoint_failure():
         return FakeMailClient(a, uids_to_return=[1, 2])
 
     def parser(raw, account_id, uid):
-        return EmailMessage(account_id=account_id, uid=uid)
+        return ParsedEmail(account_id=account_id, uid=uid)
 
     result = sync_account(
         acc,
@@ -312,7 +312,7 @@ def test_sync_all_concurrent_isolation_one_fails():
     acc3 = _account(id=3, name="a3", last_sync_uid=0)
 
     def factory(a):
-        if a.id == 2:
+        if a.name == "a2":
             return FakeMailClient(a, should_fail=True)
         return FakeMailClient(a, uids_to_return=[1])
 

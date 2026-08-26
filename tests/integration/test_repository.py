@@ -10,6 +10,7 @@ from app.models.account import Account
 from app.models.message import EmailMessage
 from app.repository.email_accounts import AccountStore
 from app.repository.emails import EmailStore
+from app.schemas.email import ParsedEmail
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql+psycopg://admin:123456@192.168.31.25:5432/email_agent"
@@ -86,7 +87,7 @@ def test_bulk_insert_and_idempotent(engine):
 
         now = datetime.now(UTC)
         msgs = [
-            EmailMessage(
+            ParsedEmail(
                 account_id=acc_id,
                 uid=1001,
                 message_id="<msg1@example.com>",
@@ -96,9 +97,8 @@ def test_bulk_insert_and_idempotent(engine):
                 sent_at=now,
                 text_body="plain 1",
                 html_body="<p>1</p>",
-                fetched_at=now,
             ),
-            EmailMessage(
+            ParsedEmail(
                 account_id=acc_id,
                 uid=1002,
                 message_id="<msg2@example.com>",
@@ -108,7 +108,6 @@ def test_bulk_insert_and_idempotent(engine):
                 sent_at=now,
                 text_body="plain 2",
                 html_body=None,
-                fetched_at=now,
             ),
         ]
 
@@ -191,9 +190,9 @@ def test_full_flow_fetch_insert_checkpoint(engine):
 
         now = datetime.now(UTC)
         msgs = [
-            EmailMessage(account_id=acc_id, uid=11, subject="a", fetched_at=now),
-            EmailMessage(account_id=acc_id, uid=12, subject="b", fetched_at=now),
-            EmailMessage(account_id=acc_id, uid=13, subject="c", fetched_at=now),
+            ParsedEmail(account_id=acc_id, uid=11, subject="a"),
+            ParsedEmail(account_id=acc_id, uid=12, subject="b"),
+            ParsedEmail(account_id=acc_id, uid=13, subject="c"),
         ]
 
         with Session(engine) as s:
