@@ -5,33 +5,12 @@ from datetime import datetime
 
 
 @dataclass(frozen=True, kw_only=True)
-class AccountSpec:
-    """服务层读取邮件所需的账号视图，与 ORM Account 解耦。"""
+class ParsedEmail:
+    """一封已解析的邮件，parser 的产出、repository 的入参。
 
-    account_id: int
-    name: str
-    last_sync_uid: int
-    host: str
-    username: str
-    password: str
-    port: int = 993
-    protocol: str = "imap"
-    use_ssl: bool = True
-    folder: str = "INBOX"
-
-
-@dataclass(frozen=True, kw_only=True)
-class RawEmail:
-    """解析器的入参：单封原始 RFC822 字节及其上下文。"""
-
-    account_id: int
-    uid: int
-    raw: bytes
-
-
-@dataclass(frozen=True, kw_only=True)
-class EmailData:
-    """解析后的邮件数据，services 层对外的统一返回对象。"""
+    字段与 ``emails`` 表当前列一一对应，但本类型不感知数据库：
+    ORM 映射只发生在 repository 层。
+    """
 
     account_id: int
     uid: int

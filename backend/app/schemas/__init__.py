@@ -1,10 +1,8 @@
-"""邮件相关跨层数据契约（schemas）。
-
-所有跨层出入参（账号视图、原始邮件、解析结果、同步报告）集中在此包声明，
-各层只 import 本包的契约类，避免 service 与 db 之间产生直接类型耦合。
-"""
-
+# 跨层数据契约：纯数据结构，不依赖 ORM、外部 SDK 或配置。
+# 任何一层都可以 import 本包；本包不 import 任何 app 内部模块。
+from app.schemas.account import AccountConfig
 from app.schemas.email import (
+    ParsedEmail,
     AccountSpec,
     AccountResult,
     BatchResult,
@@ -12,4 +10,6 @@ from app.schemas.email import (
     RawEmail,
 )
 
-__all__ = ["AccountSpec", "RawEmail", "EmailData", "AccountResult", "BatchResult"]
+__all__ = ["AccountConfig", "ParsedEmail"]
+
+__all__ = ["AccountConfig", "ParsedEmail", "AccountSpec", "RawEmail", "EmailData", "AccountResult", "BatchResult"]

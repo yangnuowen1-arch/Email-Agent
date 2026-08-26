@@ -1,27 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from types import TracebackType
 
+from app.schemas.account import AccountConfig
 
-@dataclass(frozen=True)
-class AccountConfig:
-    """邮件客户端所需的账号连接信息，本包自包含的数据契约。
-
-    字段与 ORM 的 ``Account`` 同名同义：真实 ORM 实例鸭子类型兼容，
-    可直接传入，无需在本包内反向依赖 models 层。
-    """
-
-    name: str
-    host: str
-    username: str
-    password: str
-
-    port: int = 993
-    protocol: str = "imap"
-    use_ssl: bool = True
-    folder: str = "INBOX"
+__all__ = ["AccountConfig", "MailClient", "MailClientError"]
 
 
 class MailClientError(Exception):
