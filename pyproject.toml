@@ -18,7 +18,7 @@ dev = [
 ]
 
 [project.scripts]
-email-agent = "email_agent.cli.main:main"
+email-agent = "app.cli.main:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -29,11 +29,12 @@ dev = [
     "pytest>=9.1.1",
 ]
 [tool.hatch.build.targets.wheel]
-packages = ["src/email_agent"]
+packages = ["backend/app"]
 
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+src = ["backend"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
@@ -47,8 +48,8 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["backend"]
 addopts = "-q"
 
 [tool.coverage.run]
-source = ["src"]
+source = ["app"]

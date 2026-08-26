@@ -47,8 +47,8 @@ cp .env.example .env   # 按注释填写 DATABASE_URL 等
 
 ```bash
 # 方式一：模块启动（推荐，IDE/调试友好）
-python -m email_agent
-python -m email_agent --help
+python -m app
+python -m app --help
 
 # 方式二：可执行脚本（pip install 后可用）
 email-agent
@@ -60,7 +60,7 @@ email-agent --help
 #### 5.2 启动参数
 
 ```bash
-$ python -m email_agent --help
+$ python -m app --help
 usage: email-agent [-h] [--limit LIMIT] [--full]
 
 Sync emails from IMAP to PostgreSQL incrementally
@@ -81,16 +81,16 @@ options:
 
 ```bash
 # 默认：增量拉取（只取 UID > last_sync_uid 的新邮件，成功后推进断点）
-python -m email_agent
+python -m app
 
 # 首跑限量验证（不推进断点，可反复执行观察解析/日志）
-python -m email_agent --limit 20
+python -m app --limit 20
 
 # 忽略断点全量（会推进断点到本批最大 UID）
-python -m email_agent --full
+python -m app --full
 
 # 全量限量组合（全量扫描但只取 20 封，不推进断点，调试用）
-python -m email_agent --full --limit 20
+python -m app --full --limit 20
 ```
 
 执行后终端会打印汇总表（`stdout`）且 `stderr` 输出 JSON 结构化日志，单账号失败仅日志告警，不中断其他账号：
@@ -133,19 +133,20 @@ LOG_LEVEL=INFO
 
 ```
 Email-Agent/
-├── AGENTS.md                    # 项目工作规范（先读这个）
 ├── docs/db-schema.md            # 数据库设计文档
-├── src/email_agent/
-│   ├── config/                  # AppConfig 环境变量加载
-│   ├── models/                  # Account / EmailMessage 数据契约
-│   ├── db/                      # 连接池管理
-│   ├── repository/              # 数据读写（唯一写 SQL 的地方）
-│   ├── clients/                 # MailClient ABC + factory + imap 实现
-│   ├── parsing/                 # RFC822 字节 → EmailMessage 纯函数
-│   ├── service/                 # 业务编排与并发调度
-│   └── cli/                     # python -m email_agent 入口
+├── backend/
+│   └── app/                     # 后端唯一 Python 包
+│       ├── core/                # settings（AppConfig/Settings）+ bootstrap 组合根
+│       ├── models/              # Account / EmailMessage 数据契约
+│       ├── db/                  # 引擎与连接池
+│       ├── repository/          # 数据读写（唯一写 SQL 的地方）
+│       ├── providers/email/     # MailClient ABC + factory + imap 实现
+│       ├── services/            # parsing 纯函数 + sync 编排与并发调度
+│       ├── agent/               # LLM 智能体骨架（llm / memory / tools 支撑）
+│       └── cli/                 # python -m app / email-agent 入口
+├── frontend/                    # 前端应用（开始前端开发时创建）
 └── tests/
-    ├── unit/                    # 单元测试（与 src 结构镜像）
+    ├── unit/                    # 单元测试（与 backend/app 结构镜像）
     └── integration/             # 集成测试（需真实 PG / 邮箱）
 ```
 
@@ -156,8 +157,8 @@ Email-Agent/
 pytest tests/unit
 
 # Lint 与格式化
-ruff check src tests
-ruff format --check src tests
+ruff check backend/app tests
+ruff format --check backend/app tests
 ```
 
-架构设计、分层规则、分阶段计划见 [AGENTS.md](AGENTS.md)；表结构见 [docs/db-schema.md](docs/db-schema.md)。
+表结构见 [docs/db-schema.md](docs/db-schema.md)。

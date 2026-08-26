@@ -6,12 +6,14 @@ import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
-from email_agent.models.account import Account
-from email_agent.models.message import EmailMessage
-from email_agent.repository.email_accounts import AccountStore
-from email_agent.repository.emails import EmailStore
+from app.models.account import Account
+from app.models.message import EmailMessage
+from app.repository.email_accounts import AccountStore
+from app.repository.emails import EmailStore
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://admin:123456@192.168.31.25:5432/email_agent")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", "postgresql+psycopg://admin:123456@192.168.31.25:5432/email_agent"
+)
 
 
 @pytest.fixture(scope="module")
@@ -116,7 +118,11 @@ def test_bulk_insert_and_idempotent(engine):
         assert inserted == 2
 
         with Session(engine) as s:
-            cnt = s.scalar(select(func.count()).select_from(EmailMessage).where(EmailMessage.account_id == acc_id))
+            cnt = s.scalar(
+                select(func.count())
+                .select_from(EmailMessage)
+                .where(EmailMessage.account_id == acc_id)
+            )
         assert cnt == 2
 
         # re-insert same batch should be idempotent (ON CONFLICT DO NOTHING)
@@ -126,7 +132,11 @@ def test_bulk_insert_and_idempotent(engine):
         assert inserted2 == 0
 
         with Session(engine) as s:
-            cnt = s.scalar(select(func.count()).select_from(EmailMessage).where(EmailMessage.account_id == acc_id))
+            cnt = s.scalar(
+                select(func.count())
+                .select_from(EmailMessage)
+                .where(EmailMessage.account_id == acc_id)
+            )
         assert cnt == 2
 
         # recipients TEXT[] stored correctly

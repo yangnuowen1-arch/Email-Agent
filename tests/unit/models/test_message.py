@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from email_agent.models.message import EmailMessage
+from app.models.message import EmailMessage
 
 
 def test_message_creation_with_required_fields_succeeds():

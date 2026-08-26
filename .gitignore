@@ -224,3 +224,5 @@ __marimo__/
 ..mypy_cache/
 
 .env
+.claude
+.opencode/

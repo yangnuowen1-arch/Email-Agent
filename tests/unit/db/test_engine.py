@@ -2,8 +2,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from email_agent.config.settings import AppConfig
-from email_agent.db import engine as engine_module
+from app.core.settings import AppConfig
+from app.db import engine as engine_module
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +28,7 @@ def test_get_engine_before_init_raises():
 
 def test_init_engine_creates_with_config():
     cfg = _cfg(min_size=2, max_size=10)
-    with patch("email_agent.db.engine.create_engine") as mock_create:
+    with patch("app.db.engine.create_engine") as mock_create:
         mock_eng = MagicMock()
         mock_create.return_value = mock_eng
         result = engine_module.init_engine(cfg)
@@ -41,14 +41,15 @@ def test_init_engine_creates_with_config():
 
 
 def test_init_engine_wraps_error():
-    with patch(
-        "email_agent.db.engine.create_engine", side_effect=Exception("boom")
-    ), pytest.raises(RuntimeError, match="failed to init DB engine"):
+    with (
+        patch("app.db.engine.create_engine", side_effect=Exception("boom")),
+        pytest.raises(RuntimeError, match="failed to init DB engine"),
+    ):
         engine_module.init_engine(_cfg())
 
 
 def test_init_engine_twice_replaces_and_closes_old():
-    with patch("email_agent.db.engine.create_engine") as mock_create:
+    with patch("app.db.engine.create_engine") as mock_create:
         first = MagicMock()
         second = MagicMock()
         mock_create.side_effect = [first, second]
@@ -64,7 +65,7 @@ def test_get_session_factory_before_init_raises():
 
 
 def test_get_session_factory_binds_engine():
-    with patch("email_agent.db.engine.create_engine") as mock_create:
+    with patch("app.db.engine.create_engine") as mock_create:
         mock_eng = MagicMock()
         mock_create.return_value = mock_eng
         engine_module.init_engine(_cfg())
@@ -73,7 +74,7 @@ def test_get_session_factory_binds_engine():
 
 
 def test_close_engine_clears_and_disposes():
-    with patch("email_agent.db.engine.create_engine") as mock_create:
+    with patch("app.db.engine.create_engine") as mock_create:
         mock_eng = MagicMock()
         mock_create.return_value = mock_eng
         engine_module.init_engine(_cfg())

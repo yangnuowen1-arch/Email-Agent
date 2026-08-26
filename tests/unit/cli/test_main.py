@@ -4,15 +4,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from email_agent.cli.main import (
+from app.cli.main import (
     JsonFormatter,
     _mask_url,
     parse_args,
     print_summary,
     setup_logging,
 )
-from email_agent.models.account import Account
-from email_agent.service.sync import SyncResult
+from app.models.account import Account
+from app.services.sync import SyncResult
 
 
 def _account(**overrides) -> Account:
@@ -177,14 +177,12 @@ def test_print_summary_no_results(capsys):
     assert "total=0" in out
 
 
-@patch("email_agent.cli.main.AccountStore")
-@patch("email_agent.cli.main.sync_all")
-@patch("email_agent.cli.main.AppContext")
-def test_run_sync_no_enabled_accounts(
-    mock_manager_cls, mock_sync, mock_account_store_cls, capsys
-):
-    from email_agent.cli.main import _run_sync
-    from email_agent.config.settings import AppConfig
+@patch("app.cli.main.AccountStore")
+@patch("app.cli.main.sync_all")
+@patch("app.cli.main.AppContext")
+def test_run_sync_no_enabled_accounts(mock_manager_cls, mock_sync, mock_account_store_cls, capsys):
+    from app.cli.main import _run_sync
+    from app.core.settings import AppConfig
 
     config = AppConfig(database_url="postgresql://u:p@localhost/db")
     mock_manager = MagicMock()
@@ -204,14 +202,14 @@ def test_run_sync_no_enabled_accounts(
     mock_manager.close_all.assert_called_once()
 
 
-@patch("email_agent.cli.main.AccountStore")
-@patch("email_agent.cli.main.sync_all")
-@patch("email_agent.cli.main.AppContext")
+@patch("app.cli.main.AccountStore")
+@patch("app.cli.main.sync_all")
+@patch("app.cli.main.AppContext")
 def test_run_sync_success_prints_summary_and_logs(
     mock_manager_cls, mock_sync, mock_account_store_cls, capsys, caplog
 ):
-    from email_agent.cli.main import _run_sync
-    from email_agent.config.settings import AppConfig
+    from app.cli.main import _run_sync
+    from app.core.settings import AppConfig
 
     config = AppConfig(database_url="postgresql://u:p@localhost/db")
     mock_manager = MagicMock()
@@ -247,14 +245,14 @@ def test_run_sync_success_prints_summary_and_logs(
     mock_manager.close_all.assert_called_once()
 
 
-@patch("email_agent.cli.main.AccountStore")
-@patch("email_agent.cli.main.sync_all")
-@patch("email_agent.cli.main.AppContext")
+@patch("app.cli.main.AccountStore")
+@patch("app.cli.main.sync_all")
+@patch("app.cli.main.AppContext")
 def test_run_sync_with_failures_logs_but_returns_zero(
     mock_manager_cls, mock_sync, mock_account_store_cls, caplog
 ):
-    from email_agent.cli.main import _run_sync
-    from email_agent.config.settings import AppConfig
+    from app.cli.main import _run_sync
+    from app.core.settings import AppConfig
 
     config = AppConfig(database_url="postgresql://u:p@localhost/db")
     mock_manager = MagicMock()
@@ -287,10 +285,10 @@ def test_run_sync_with_failures_logs_but_returns_zero(
     assert "s3cr3t" not in caplog.text
 
 
-@patch("email_agent.cli.main.AppContext", side_effect=Exception("db down"))
+@patch("app.cli.main.AppContext", side_effect=Exception("db down"))
 def test_run_sync_init_pool_failure_returns_one(mock_manager_cls, caplog):
-    from email_agent.cli.main import _run_sync
-    from email_agent.config.settings import AppConfig
+    from app.cli.main import _run_sync
+    from app.core.settings import AppConfig
 
     config = AppConfig(database_url="postgresql://u:p@localhost/db")
     setup_logging("INFO")
@@ -301,13 +299,13 @@ def test_run_sync_init_pool_failure_returns_one(mock_manager_cls, caplog):
     assert "failed to init DB engine" in caplog.text
 
 
-@patch("email_agent.cli.main.AccountStore")
-@patch("email_agent.cli.main.AppContext")
+@patch("app.cli.main.AccountStore")
+@patch("app.cli.main.AppContext")
 def test_run_sync_get_accounts_failure_returns_one(
     mock_manager_cls, mock_account_store_cls, caplog
 ):
-    from email_agent.cli.main import _run_sync
-    from email_agent.config.settings import AppConfig
+    from app.cli.main import _run_sync
+    from app.core.settings import AppConfig
 
     config = AppConfig(database_url="postgresql://u:p@localhost/db")
     mock_manager = MagicMock()
@@ -323,11 +321,11 @@ def test_run_sync_get_accounts_failure_returns_one(
     assert code == 1
 
 
-@patch("email_agent.cli.main._run_sync", return_value=0)
-@patch("email_agent.cli.main.AppConfig.from_env")
+@patch("app.cli.main._run_sync", return_value=0)
+@patch("app.cli.main.AppConfig.from_env")
 def test_main_success_exits_zero(mock_from_env, mock_run):
-    from email_agent.cli.main import main
-    from email_agent.config.settings import AppConfig
+    from app.cli.main import main
+    from app.core.settings import AppConfig
 
     mock_from_env.return_value = AppConfig(
         database_url="postgresql://u:p@localhost/db", log_level="INFO"
@@ -337,9 +335,9 @@ def test_main_success_exits_zero(mock_from_env, mock_run):
     assert exc.value.code == 0
 
 
-@patch("email_agent.cli.main.AppConfig.from_env", side_effect=ValueError("DATABASE_URL missing"))
+@patch("app.cli.main.AppConfig.from_env", side_effect=ValueError("DATABASE_URL missing"))
 def test_main_config_error_exits_2(mock_from_env, caplog):
-    from email_agent.cli.main import main
+    from app.cli.main import main
 
     with pytest.raises(SystemExit) as exc:
         main([])
@@ -347,7 +345,7 @@ def test_main_config_error_exits_2(mock_from_env, caplog):
 
 
 def test_main_limit_validation_exits_2():
-    from email_agent.cli.main import main
+    from app.cli.main import main
 
     with pytest.raises(SystemExit) as exc:
         main(["--limit", "0"])
@@ -355,11 +353,11 @@ def test_main_limit_validation_exits_2():
     assert exc.value.code == 2
 
 
-@patch("email_agent.cli.main._run_sync", return_value=0)
-@patch("email_agent.cli.main.AppConfig.from_env")
+@patch("app.cli.main._run_sync", return_value=0)
+@patch("app.cli.main.AppConfig.from_env")
 def test_main_passes_limit_and_full_to_run(mock_from_env, mock_run):
-    from email_agent.cli.main import main
-    from email_agent.config.settings import AppConfig
+    from app.cli.main import main
+    from app.core.settings import AppConfig
 
     mock_from_env.return_value = AppConfig(database_url="postgresql://u:p@localhost/db")
     with pytest.raises(SystemExit):

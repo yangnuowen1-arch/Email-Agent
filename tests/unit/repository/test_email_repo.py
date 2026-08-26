@@ -4,8 +4,8 @@ from unittest.mock import MagicMock
 import pytest
 from sqlalchemy.dialects import postgresql
 
-from email_agent.models.message import EmailMessage
-from email_agent.repository.emails import EmailStore
+from app.models.message import EmailMessage
+from app.repository.emails import EmailStore
 
 
 @pytest.fixture

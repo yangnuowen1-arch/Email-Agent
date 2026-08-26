@@ -1,7 +1,6 @@
-
 import pytest
 
-from email_agent.models.account import Account
+from app.models.account import Account
 
 
 def test_account_creation_with_required_fields_succeeds():
