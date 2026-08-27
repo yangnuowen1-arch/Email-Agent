@@ -86,18 +86,19 @@ ORDER BY id;
 | 目的 | 命令 |
 |---|---|
 | 查看帮助 | `uv run python -m app --help` |
-| 正常增量同步 | `uv run python -m app` |
-| 调试时最多拉取 20 封 | `uv run python -m app --limit 20` |
-| 忽略断点，全量同步 | `uv run python -m app --full` |
-| 已安装脚本入口 | `uv run email-agent` |
+| 正常增量同步 | `uv run python -m app ingest` |
+| 调试时最多拉取 20 封 | `uv run python -m app ingest --limit 20` |
+| 忽略断点，全量同步 | `uv run python -m app ingest --full` |
+| 已安装脚本入口 | `uv run email-agent ingest` |
 
-`email-agent` 是命令名；`app` 是 Python 模块名。它们都指向同一个同步程序。
+`email-agent` 是命令名；`app` 是 Python 模块名。它们都通过 `ingest` 子命令执行同步；
+裸执行 `python -m app` 或 `email-agent` 只显示帮助，不会访问邮箱或数据库。
 
 ### 参数说明
 
 | 参数 | 说明 |
 |---|---|
-| 无参数 | 仅拉取 UID 大于 `last_sync_uid` 的新邮件；成功后推进断点。 |
+| `ingest` | 仅拉取 UID 大于 `last_sync_uid` 的新邮件；成功后推进断点。 |
 | `--limit N` | 最多处理待拉取邮件中 UID 最小的 `N` 封。会写入邮件，但**不会**推进断点，因此适合调试，不适合正式同步。 |
 | `--full` | 忽略断点并扫描整个文件夹；成功后推进断点。邮箱邮件很多时请谨慎使用。 |
 | `--full --limit N` | 扫描全量范围但仅处理最旧的 `N` 封；不推进断点。 |
@@ -105,16 +106,10 @@ ORDER BY id;
 程序输出类似：
 
 ```text
-Sync Summary (full=False, limit=None, total=1)
---------------------------------------------------------------------------------
-account              fetched inserted skipped  max_uid  status
---------------------------------------------------------------------------------
-test-mailbox (id=1)        1        1       0      105  OK
---------------------------------------------------------------------------------
-Total: 1 accounts, 1 fetched, 1 inserted, 0 failed
+inserted=1 skipped=0 failed=0 duration_ms=42
 ```
 
-不要只看进程退出码：某个账号同步失败时，程序会继续处理其他账号。请检查汇总中的 `status` 和 `failed` 数量。
+不要只看进程退出码：某个账号同步失败时，程序会继续处理其他账号。请检查汇总中的 `failed` 数量。
 
 ## 验证今天的邮件同步
 
@@ -127,7 +122,7 @@ Total: 1 accounts, 1 fetched, 1 inserted, 0 failed
 然后运行正常增量同步：
 
 ```bash
-uv run python -m app
+uv run python -m app ingest
 ```
 
 在 PostgreSQL 中确认这封邮件已写入。以下查询按上海自然日查看“今天被程序拉取”的邮件：
@@ -144,7 +139,7 @@ WHERE e.subject = '[Email-Agent Test] 2026-08-26-001'
 ORDER BY e.fetched_at DESC;
 ```
 
-再次运行同一条同步命令且没有新邮件时，应看到 `fetched=0`、`inserted=0`，这说明断点生效。
+再次运行同一条同步命令且没有新邮件时，应看到 `inserted=0`、`skipped=0`，这说明断点生效。
 
 注意：首次同步时 `last_sync_uid=0` 会拉取整个文件夹。建议用专门的测试邮箱，或先完成一次基线同步。`--limit 20` 不会推进断点，重复执行会再次拉取同一批候选邮件。
 

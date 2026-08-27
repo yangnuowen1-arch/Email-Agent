@@ -1,15 +1,14 @@
-# 跨层数据契约：纯数据结构，不依赖 ORM、外部 SDK 或配置。
-# 任何一层都可以 import 本包；本包不 import 任何 app 内部模块。
-from app.schemas.account import AccountConfig
-from app.schemas.email import (
-    ParsedEmail,
-    AccountSpec,
-    AccountResult,
-    BatchResult,
-    EmailData,
-    RawEmail,
-)
+"""跨层数据契约：纯数据结构，不依赖 ORM、外部 SDK 或配置。"""
 
-__all__ = ["AccountConfig", "ParsedEmail"]
+from app.schemas.account import AccountConfig, AccountSpec
+from app.schemas.email import AccountResult, BatchResult, EmailData, ParsedEmail, RawEmail
 
-__all__ = ["AccountConfig", "ParsedEmail", "AccountSpec", "RawEmail", "EmailData", "AccountResult", "BatchResult"]
+__all__ = [
+    "AccountConfig",
+    "AccountSpec",
+    "RawEmail",
+    "ParsedEmail",
+    "EmailData",
+    "AccountResult",
+    "BatchResult",
+]

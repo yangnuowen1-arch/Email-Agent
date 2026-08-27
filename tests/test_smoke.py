@@ -34,3 +34,23 @@ def test_cli_help_exits_zero() -> None:
 
     # 新设计：无 CLI 参数，同步能力以子命令暴露
     assert "ingest" in result.stdout
+
+
+def test_ingest_help_lists_sync_options() -> None:
+    source_root = Path(__file__).resolve().parents[1] / "backend"
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(source_root) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+    }
+
+    result = subprocess.run(
+        [sys.executable, "-m", "app", "ingest", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    assert "--full" in result.stdout
+    assert "--limit" in result.stdout

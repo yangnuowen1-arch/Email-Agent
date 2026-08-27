@@ -20,3 +20,15 @@ class AccountConfig:
     protocol: str = "imap"
     use_ssl: bool = True
     folder: str = "INBOX"
+
+
+@dataclass(frozen=True, kw_only=True)
+class AccountSpec(AccountConfig):
+    """一次同步所需的账号视图。
+
+    在连接配置之外，服务层还需要账号标识和增量断点；继承
+    :class:`AccountConfig` 可让 provider 继续只依赖连接配置契约。
+    """
+
+    account_id: int
+    last_sync_uid: int

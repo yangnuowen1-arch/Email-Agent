@@ -5,6 +5,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from app.core.ingest import IngestCoordinator
 from app.core.settings import AppConfig
 from app.db.db import Account
@@ -58,14 +60,16 @@ def _messages(*uids: int) -> list[EmailData]:
     return [EmailData(account_id=1, uid=u, subject=f"s{u}") for u in uids]
 
 
-def _mock_session(accounts):
+def _mock_session(accounts, *, inserted_count: int = 2):
     session = AsyncMock()
     # scalars() 返回 MagicMock（其 .all() 给出账号列表）；注意 AsyncMock 的
     # return_value 本身是 AsyncMock，会令 .all() 变成协程导致无法迭代，故显式用 MagicMock
     scalars_result = MagicMock(all=MagicMock(return_value=accounts))
     session.scalars = AsyncMock(return_value=scalars_result)
-    # execute() 返回 MagicMock（其 .fetchall() 给出插入行数）
-    execute_result = MagicMock(fetchall=MagicMock(return_value=[(1,), (2,)]))
+    # execute() 返回 MagicMock（其 .fetchall() 给出实际插入行数）
+    execute_result = MagicMock(
+        fetchall=MagicMock(return_value=[(index,) for index in range(inserted_count)])
+    )
     session.execute = AsyncMock(return_value=execute_result)
     return session
 
@@ -82,6 +86,7 @@ async def test_ingest_accounts_persists_and_advances_checkpoint():
     assert report.total_skipped == 1  # 3 解析 - 2 插入
     assert report.total_failed == 0
     assert report.results[0].inserted == 2
+    assert reader.calls == [(1, False, None)]
     # bulk_create 一次 + 断点推进一次 = 两次 execute
     assert session.execute.await_count == 2
 
@@ -95,20 +100,21 @@ async def test_ingest_accounts_limit_mode_does_not_advance_checkpoint():
     report = await coordinator.ingest_accounts(limit=10)
 
     assert report.total_inserted == 2
+    assert reader.calls == [(1, False, 10)]
     # 限量模式不推进断点：仅 bulk_create 一次 execute
     assert session.execute.await_count == 1
 
 
 async def test_ingest_accounts_isolates_per_account_failure():
     accounts = [_account(1), _account(2)]
-    session = _mock_session(accounts)
+    session = _mock_session(accounts, inserted_count=1)
     reader = FakeReader({1: _messages(6), 2: RuntimeError("read boom")})
     coordinator = IngestCoordinator(FakeDatabase(session), reader, _config())
 
     report = await coordinator.ingest_accounts()
 
     assert report.total_failed == 1
-    assert report.total_inserted == 2  # 仅账号 1 成功
+    assert report.total_inserted == 1  # 仅账号 1 成功
     failed = [r for r in report.results if r.error is not None]
     assert len(failed) == 1
     assert "read boom" in failed[0].error
@@ -126,3 +132,37 @@ async def test_ingest_accounts_empty_messages_does_not_write():
     assert report.total_failed == 0
     # 无邮件时不打开存储事务、不执行写入
     session.execute.assert_not_awaited()
+    assert reader.calls == [(1, False, None)]
+
+
+async def test_ingest_accounts_full_mode_advances_checkpoint():
+    account = _account(last_sync_uid=5)
+    session = _mock_session([account], inserted_count=2)
+    reader = FakeReader({1: _messages(1, 2, 8)})
+    coordinator = IngestCoordinator(FakeDatabase(session), reader, _config())
+
+    report = await coordinator.ingest_accounts(full=True)
+
+    assert report.total_inserted == 2
+    assert reader.calls == [(1, True, None)]
+    assert session.execute.await_count == 2
+
+
+async def test_ingest_accounts_full_limit_mode_does_not_advance_checkpoint():
+    account = _account(last_sync_uid=5)
+    session = _mock_session([account], inserted_count=2)
+    reader = FakeReader({1: _messages(1, 2, 8)})
+    coordinator = IngestCoordinator(FakeDatabase(session), reader, _config())
+
+    report = await coordinator.ingest_accounts(full=True, limit=2)
+
+    assert report.total_inserted == 2
+    assert reader.calls == [(1, True, 2)]
+    assert session.execute.await_count == 1
+
+
+async def test_ingest_accounts_rejects_non_positive_limit():
+    coordinator = IngestCoordinator(None, None, _config())
+
+    with pytest.raises(ValueError, match="limit"):
+        await coordinator.ingest_accounts(limit=0)

@@ -2,6 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import TypeAlias
+
+
+@dataclass(frozen=True, kw_only=True)
+class RawEmail:
+    """解析器的入参：单封原始 RFC822 字节及其同步上下文。"""
+
+    account_id: int
+    uid: int
+    raw: bytes
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -22,6 +32,11 @@ class ParsedEmail:
     text_body: str | None = None
     html_body: str | None = None
     fetched_at: datetime | None = None
+
+
+# ``EmailData`` 是合并前已公开使用的名称。保留它作为同一 DTO 的
+# 兼容别名，避免服务层、测试和下游调用方同时出现两种不同的邮件类型。
+EmailData: TypeAlias = ParsedEmail
 
 
 @dataclass(frozen=True, kw_only=True)

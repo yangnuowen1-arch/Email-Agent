@@ -1,5 +1,6 @@
-# 确定性领域逻辑层对外导出：解析纯函数 + 同步编排
-from app.services.parsing import parse_email  # RFC822 字节 → ParsedEmail
-from app.services.sync import SyncResult, sync_account, sync_all  # 同步结果与核心编排函数
+"""确定性领域逻辑层的公开入口。"""
+
+from app.services.email import EmailService
+from app.services.parsing import parse_email
 
 __all__ = ["EmailService", "parse_email"]

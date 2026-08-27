@@ -15,7 +15,11 @@ app = typer.Typer(
 
 @app.callback()
 def cli(ctx: typer.Context) -> None:
-    """构建容器并存入上下文；具体工作由子命令执行。"""
+    """构建子命令所需的容器；裸命令仅显示帮助。"""
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit()
+
     try:
         config = AppConfig.from_env()
     except ValueError as exc:
@@ -38,45 +42,61 @@ def cli(ctx: typer.Context) -> None:
 
 
 @app.command()
-def ingest(ctx: typer.Context) -> None:
-    """从各启用账号拉取邮件并落库（并发数/超时由配置决定，无命令行参数）。"""
+def ingest(
+    ctx: typer.Context,
+    full: bool = typer.Option(
+        False,
+        "--full",
+        help="忽略断点，扫描整个邮箱文件夹。",
+    ),
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
+        min=1,
+        help="最多处理 N 封邮件；指定后不会推进同步断点。",
+    ),
+) -> None:
+    """从各启用账号拉取邮件并落库。"""
     container: Container = ctx.obj
-    asyncio.run(_run(container))
+    asyncio.run(_run(container, full=full, limit=limit))
 
 
-async def _run(container: Container) -> None:
+async def _run(container: Container, *, full: bool, limit: int | None) -> None:
     log = container.logger
-    log.info("ingest_started")
+    log.info("ingest_started", full=full, limit=limit)
 
-    report = await container.coordinator.ingest_accounts()
+    try:
+        report = await container.coordinator.ingest_accounts(full=full, limit=limit)
 
-    log.info(
-        "ingest_finished",
-        inserted=report.total_inserted,
-        skipped=report.total_skipped,
-        failed=report.total_failed,
-        duration_ms=report.duration_ms,
-    )
-    typer.echo(
-        f"inserted={report.total_inserted} skipped={report.total_skipped} "
-        f"failed={report.total_failed} duration_ms={report.duration_ms}"
-    )
-    for result in report.results:
-        if result.error:
-            log.error(
-                "account_ingest_failed",
-                account_id=result.account_id,
-                account_name=result.name,
-                error=result.error,
-            )
-            typer.echo(
-                f"  account {result.account_id} ({result.name}) ERROR: {result.error}",
-                err=True,
-            )
-
-    # close_all 是异步生命周期；CLI 是同步边界，由这里桥接事件循环
-    await container.close_all()
-    log.info("container_closed")
+        log.info(
+            "ingest_finished",
+            full=full,
+            limit=limit,
+            inserted=report.total_inserted,
+            skipped=report.total_skipped,
+            failed=report.total_failed,
+            duration_ms=report.duration_ms,
+        )
+        typer.echo(
+            f"inserted={report.total_inserted} skipped={report.total_skipped} "
+            f"failed={report.total_failed} duration_ms={report.duration_ms}"
+        )
+        for result in report.results:
+            if result.error:
+                log.error(
+                    "account_ingest_failed",
+                    account_id=result.account_id,
+                    account_name=result.name,
+                    error=result.error,
+                )
+                typer.echo(
+                    f"  account {result.account_id} ({result.name}) ERROR: {result.error}",
+                    err=True,
+                )
+    finally:
+        # 无论同步是否在进程级失败，都要释放数据库连接池。
+        await container.close_all()
+        log.info("container_closed")
 
 
 def main() -> None:
