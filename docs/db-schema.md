@@ -138,8 +138,8 @@ COMMENT ON COLUMN emails.updated_at IS '最后更新时间（UTC），随行更�
 
 1. 同步前读取 `last_sync_uid = N`；
 2. 仅拉取 `UID > N` 的邮件；
-3. 本批全部成功入库后，将 `last_sync_uid` 更新为本批最大 UID、刷新 `last_sync_at`；
-4. 中途失败则不推进断点，下次重拉（配合 ON CONFLICT 幂等，重拉无副作用）。
+3. 本批全部成功入库后，将 `last_sync_uid` 更新为本批最大 UID、刷新 `last_sync_at`；无新邮件时 UID 保持不变但仍刷新成功时间；
+4. 中途失败则不推进断点，下次重拉（配合 ON CONFLICT 幂等，重拉无副作用）。对于部分 IMAP FETCH 或解析失败，已成功邮件可先入库，但账号断点仍保持不变。
 
 ## 4. 变更记录
 

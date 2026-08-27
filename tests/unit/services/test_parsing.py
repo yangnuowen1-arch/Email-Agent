@@ -1,10 +1,10 @@
-"""services.parsing.parse_email 单元测试：入参 RawEmail、出参 EmailData，零 app.db 依赖。"""
+"""services.parsing.parse_email 单元测试：入参 RawEmail、出参 ParsedEmail，零 app.db 依赖。"""
 
 from __future__ import annotations
 
 import pytest
 
-from app.schemas import EmailData, RawEmail
+from app.schemas import ParsedEmail, RawEmail
 from app.services.parsing import parse_email
 
 _VALID_RAW = (
@@ -21,7 +21,7 @@ _VALID_RAW = (
 def test_parse_email_returns_email_data_with_expected_fields():
     result = parse_email(RawEmail(account_id=1, uid=10, raw=_VALID_RAW))
 
-    assert isinstance(result, EmailData)
+    assert isinstance(result, ParsedEmail)
     assert result.account_id == 1
     assert result.uid == 10
     assert result.subject == "Test Subject"
@@ -35,7 +35,7 @@ def test_parse_email_returns_email_data_with_expected_fields():
 def test_parse_email_empty_raw_returns_defaults():
     result = parse_email(RawEmail(account_id=1, uid=0, raw=b""))
 
-    assert isinstance(result, EmailData)
+    assert isinstance(result, ParsedEmail)
     assert result.subject == ""
     assert result.recipients == []
     assert result.sender is None
@@ -55,6 +55,6 @@ def test_parse_email_rejects_bad_uid():
 def test_parse_email_malformed_raw_is_tolerated():
     result = parse_email(RawEmail(account_id=1, uid=1, raw=b"not a valid email at all"))
 
-    assert isinstance(result, EmailData)
+    assert isinstance(result, ParsedEmail)
     assert result.uid == 1
     assert result.subject == ""

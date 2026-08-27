@@ -1,3 +1,5 @@
+"""IMAP implementation of the low-level mail-client contract."""
+
 from __future__ import annotations
 
 import contextlib
@@ -5,7 +7,10 @@ from typing import Any
 
 from imapclient import IMAPClient
 
-from app.providers.email.base import AccountConfig, MailClient, MailClientError
+from .base import AccountConfig, MailClient, MailClientError, MailFetchResult
+
+__all__ = ["DEFAULT_TIMEOUT", "ImapMailClient"]
+
 
 # IMAP 连接默认超时时间（秒），避免网络异常时无限阻塞
 DEFAULT_TIMEOUT = 30
@@ -51,8 +56,8 @@ class ImapMailClient(MailClient):
         folder: str,
         since_uid: int,
         limit: int | None = None,
-    ) -> list[tuple[int, bytes]]:
-        """增量拉取邮件，返回 UID 大于 since_uid 的原始 RFC822 字节。"""
+    ) -> MailFetchResult:
+        """增量拉取邮件，并显式报告服务器未能返回的 UID。"""
         if self._client is None:
             raise MailClientError(f"[{self.account.name}] not connected; call connect() first")
 
@@ -72,7 +77,7 @@ class ImapMailClient(MailClient):
             criteria = ["ALL"] if since_uid == 0 else ["UID", f"{since_uid + 1}:*"]
             uids: list[int] = self._client.search(criteria)  # type: ignore[arg-type]
             if not uids:
-                return []
+                return MailFetchResult()
 
             # 升序保证处理顺序稳定；limit 截断时取最旧的一批
             uids = sorted(uids)
@@ -81,16 +86,20 @@ class ImapMailClient(MailClient):
 
             fetch_data = self._client.fetch(uids, [b"RFC822"])
 
-            result: list[tuple[int, bytes]] = []
+            messages: list[tuple[int, bytes]] = []
+            failed_uids: list[int] = []
             for uid in uids:
                 entry = fetch_data.get(uid)
 
-                # 已删除/缺失/非 bytes 的条目跳过，不污染下游解析
+                # 已删除、缺失或非 bytes 的条目不能被静默跳过；上层据此
+                # 暂停 checkpoint，避免后续 UID 把它永久跨过去。
                 raw = entry.get(b"RFC822") if entry else None
                 if isinstance(raw, bytes):
-                    result.append((uid, raw))
+                    messages.append((uid, raw))
+                else:
+                    failed_uids.append(uid)
 
-            return result
+            return MailFetchResult(messages=tuple(messages), failed_uids=tuple(failed_uids))
 
         except Exception as exc:
             # 统一包装为 MailClientError，保持 service 层异常隔离逻辑一致

@@ -8,7 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 import app.cli.main as cli_main
-from app.schemas import BatchResult
+from app.schemas import SyncReport
 
 
 class _Logger:
@@ -22,22 +22,22 @@ class _Logger:
         self.events.append((event, fields))
 
 
-class _Coordinator:
+class _MailSync:
     def __init__(self, *, error: Exception | None = None) -> None:
         self.calls: list[tuple[bool, int | None]] = []
         self.error = error
 
-    async def ingest_accounts(self, *, full: bool, limit: int | None) -> BatchResult:
-        self.calls.append((full, limit))
+    async def ingest(self, request) -> SyncReport:
+        self.calls.append((request.full, request.limit))
         if self.error is not None:
             raise self.error
-        return BatchResult(total_inserted=2, total_skipped=1, duration_ms=12)
+        return SyncReport(total_inserted=2, total_skipped=1, duration_ms=12)
 
 
 class _Container:
     def __init__(self, *, error: Exception | None = None) -> None:
         self.logger = _Logger()
-        self.coordinator = _Coordinator(error=error)
+        self.mail_sync = _MailSync(error=error)
         self.close_calls = 0
 
     async def close_all(self) -> None:
@@ -51,7 +51,7 @@ def _install_fake_container(monkeypatch: pytest.MonkeyPatch, container: _Contain
         "from_env",
         classmethod(lambda _cls: config),
     )
-    monkeypatch.setattr(cli_main, "Container", lambda _config: container)
+    monkeypatch.setattr(cli_main, "build_container", lambda _config: container)
 
 
 @pytest.mark.parametrize(
@@ -74,7 +74,7 @@ def test_ingest_forwards_sync_options(
     result = CliRunner().invoke(cli_main.app, ["ingest", *args])
 
     assert result.exit_code == 0
-    assert container.coordinator.calls == [expected]
+    assert container.mail_sync.calls == [expected]
     assert container.close_calls == 1
     assert "inserted=2 skipped=1 failed=0 duration_ms=12" in result.stdout
 
@@ -106,7 +106,7 @@ def test_ingest_rejects_invalid_limit(monkeypatch: pytest.MonkeyPatch, value: st
     result = CliRunner().invoke(cli_main.app, ["ingest", "--limit", value])
 
     assert result.exit_code == 2
-    assert container.coordinator.calls == []
+    assert container.mail_sync.calls == []
 
 
 def test_ingest_closes_container_after_fatal_error(monkeypatch: pytest.MonkeyPatch) -> None:

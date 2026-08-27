@@ -1,10 +1,15 @@
+"""Mail client registration and construction."""
+
 from __future__ import annotations
 
-from app.providers.email.base import AccountConfig, MailClient
-from app.providers.email.imap.client import ImapMailClient
+from .base import AccountConfig, MailClient
+from .imap_client import ImapMailClient
+
+__all__ = ["create_client", "register_client"]
+
 
 # 协议注册表：协议名（小写）→ 对应的 MailClient 子类。
-# 新增协议只需在此注册，调度层零改动
+# 新增协议只需在此注册，调度层零改动。
 _REGISTRY: dict[str, type[MailClient]] = {"imap": ImapMailClient}
 
 
@@ -26,7 +31,8 @@ def register_client(protocol: str, cls: type[MailClient]) -> None:
         msg = f"cls must be a MailClient subclass, got {cls!r}"
         raise TypeError(msg)
 
-    # 统一转为小写存储，实现大小写不敏感的查找；允许覆盖内置注册以支持定制
+    # 统一转为小写存储，实现大小写不敏感的查找；
+    # 允许覆盖内置注册以支持定制。
     _REGISTRY[protocol.strip().lower()] = cls
 
 

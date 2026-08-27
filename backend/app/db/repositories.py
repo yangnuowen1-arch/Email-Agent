@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import case, delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,7 +50,7 @@ class EmailAccountRepository:
         last_sync_uid: int,
         last_sync_at: datetime | None = None,
     ) -> None:
-        """推进账号的增量断点（last_sync_uid / last_sync_at）。"""
+        """单调推进账号的增量断点，并刷新最近成功同步时间。"""
         if not isinstance(account_id, int) or account_id <= 0:
             msg = f"account_id must be positive int, got {account_id!r}"
             raise ValueError(msg)
@@ -63,7 +63,15 @@ class EmailAccountRepository:
         stmt = (
             update(Account)
             .where(Account.id == account_id)
-            .values(last_sync_uid=last_sync_uid, last_sync_at=last_sync_at)
+            .values(
+                # Concurrent sync processes must never overwrite a newer cursor
+                # with an older one read at the beginning of their own run.
+                last_sync_uid=case(
+                    (Account.last_sync_uid > last_sync_uid, Account.last_sync_uid),
+                    else_=last_sync_uid,
+                ),
+                last_sync_at=last_sync_at,
+            )
         )
         await self.session.execute(stmt)
 

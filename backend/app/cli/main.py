@@ -4,8 +4,9 @@ import asyncio
 
 import typer
 
-from app.core.container import Container
+from app.core.container import Container, build_container
 from app.core.settings import AppConfig
+from app.schemas import SyncRequest
 
 app = typer.Typer(
     help="email-agent-cli",
@@ -27,7 +28,7 @@ def cli(ctx: typer.Context) -> None:
         raise typer.Exit(code=2) from exc
 
     try:
-        container = Container(config)
+        container = build_container(config)
     except Exception as exc:
         typer.echo(f"failed to init DB engine: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -66,7 +67,7 @@ async def _run(container: Container, *, full: bool, limit: int | None) -> None:
     log.info("ingest_started", full=full, limit=limit)
 
     try:
-        report = await container.coordinator.ingest_accounts(full=full, limit=limit)
+        report = await container.mail_sync.ingest(SyncRequest(full=full, limit=limit))
 
         log.info(
             "ingest_finished",

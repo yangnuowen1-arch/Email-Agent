@@ -90,6 +90,16 @@ class TestEmailAccountRepository:
         assert acc.last_sync_uid == 42
         assert acc.last_sync_at is not None
 
+    async def test_update_account_checkpoint_never_moves_cursor_backwards(self, session):
+        repo = EmailAccountRepository(session)
+        acc = await repo.create_account(_make_account(last_sync_uid=42))
+
+        await repo.update_account_checkpoint(acc.id, 5)
+        await session.flush()
+        await session.refresh(acc)
+
+        assert acc.last_sync_uid == 42
+
     async def test_update_account_checkpoint_rejects_bad_id(self, session):
         repo = EmailAccountRepository(session)
         with pytest.raises(ValueError, match="account_id"):

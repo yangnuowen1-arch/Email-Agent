@@ -29,10 +29,6 @@ class Base(DeclarativeBase):
     metadata = MetaData()
 
 
-# 当前支持的邮件协议集合，新增协议时在此扩展，factory 会据此路由
-_SUPPORTED_PROTOCOLS = {"imap"}
-
-
 def _now_utc() -> datetime:
     """返回当前 UTC 时间，作为 fetched_at 的默认工厂。"""
     # 使用 UTC 时区，避免服务器本地时区差异导致的时间混乱
@@ -42,9 +38,8 @@ def _now_utc() -> datetime:
 class Account(Base):
     """邮箱账号 ORM 模型，对应数据库 email_accounts 表的一行。
 
-    既是领域契约（供 parser/client/service/cli 使用），也是持久化实体：
-    通过 Session 查询即返回该对象，跨线程传值时因 expire_on_commit=False
-    可直接读取已加载的标量字段（如 host/port/username 等）。
+    这是持久化模型，不是 provider 或 service 的数据契约。数据库适配器会将
+    它投影为 ``AccountSpec``，从而避免 IMAP/业务代码依赖 SQLAlchemy 实体。
     """
 
     __tablename__ = "email_accounts"
@@ -57,7 +52,7 @@ class Account(Base):
     host: Mapped[str] = mapped_column(String)
     # 服务端口，SSL 场景默认 993
     port: Mapped[int] = mapped_column(Integer, default=993)
-    # 协议标识，当前仅支持 imap，factory 据此创建具体 MailClient
+    # 入站协议标识，由 provider factory 选择具体客户端
     protocol: Mapped[str] = mapped_column(String, default="imap")
     # 登录用户名，通常为完整邮箱地址
     username: Mapped[str] = mapped_column(String)
@@ -104,10 +99,8 @@ class Account(Base):
         if not isinstance(port, int) or not 1 <= port <= 65535:
             msg = f"port must be int in 1..65535, got {port!r}"
             raise ValueError(msg)
-        # 协议必须在支持列表中，否则 factory 无法创建客户端
-        if protocol not in _SUPPORTED_PROTOCOLS:
-            msg = f"protocol must be one of {sorted(_SUPPORTED_PROTOCOLS)}, got {protocol!r}"
-            raise ValueError(msg)
+        if not protocol:
+            raise ValueError("protocol must be non-empty")
         # 登录凭证不能为空
         if not username:
             raise ValueError("username must be non-empty")
@@ -134,14 +127,6 @@ class Account(Base):
         self.last_sync_uid = last_sync_uid
         self.last_sync_at = last_sync_at
 
-    @validates("protocol")
-    def _validate_protocol(self, key: str, value: str) -> str:
-        # 与 __init__ 保持一致的协议白名单校验（ORM 加载/赋值时也会触发）
-        if value not in _SUPPORTED_PROTOCOLS:
-            msg = f"protocol must be one of {sorted(_SUPPORTED_PROTOCOLS)}, got {value!r}"
-            raise ValueError(msg)
-        return value
-
     @validates("last_sync_uid")
     def _validate_last_sync_uid(self, key: str, value: int) -> int:
         if not isinstance(value, int) or value < 0:
@@ -153,8 +138,8 @@ class Account(Base):
 class EmailMessage(Base):
     """已解析邮件 ORM 模型，对应数据库 emails 表的一行。
 
-    parser 解析出的对象即该模型的瞬时实例（未绑定 Session），
-    由 repository 通过幂等批量插入写入数据库。
+    ``ParsedEmail`` 是 parser 的产出；SQLAlchemy storage adapter 在持久化边界
+    将其转换为本模型，再由 repository 做幂等批量插入。
     """
 
     __tablename__ = "emails"

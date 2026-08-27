@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from app.providers.email.base import AccountConfig
-from app.providers.email.imap.client import ImapMailClient
+from app.providers.email.imap_client import ImapMailClient
 
 
 def _config(**overrides) -> AccountConfig:
@@ -40,13 +40,28 @@ def test_imap_client_works_with_pure_config_without_orm_account():
     client.connect()
     result = client.fetch_emails("INBOX", since_uid=5)
 
-    assert result == [(7, b"raw")]
+    assert result.messages == ((7, b"raw"),)
+    assert result.failed_uids == ()
     mock_instance.login.assert_called_once_with("u@example.com", "s3cr3t")
 
 
-def test_import_email_provider_does_not_load_models():
-    # 在干净解释器中导入本包后，models 模块不应被加载（无跨包依赖）
-    code = "import app.providers.email, sys; print('app.models' in sys.modules)"
+def test_imap_client_reports_missing_fetch_entries_instead_of_silently_skipping_them():
+    mock_instance = MagicMock()
+    mock_instance.search.return_value = [6, 7]
+    mock_instance.fetch.return_value = {7: {b"RFC822": b"raw"}}
+    mock_cls = MagicMock(return_value=mock_instance)
+
+    client = ImapMailClient(_config(), client_cls=mock_cls)
+    client.connect()
+    result = client.fetch_emails("INBOX", since_uid=5)
+
+    assert result.messages == ((7, b"raw"),)
+    assert result.failed_uids == (6,)
+
+
+def test_import_email_provider_does_not_load_database_layer():
+    # 在干净解释器中导入 provider 后，数据库基础设施不应被加载。
+    code = "import app.providers.email, sys; print('app.db' in sys.modules)"
     source_root = Path(__file__).resolve().parents[4] / "backend"
     env = {
         **os.environ,

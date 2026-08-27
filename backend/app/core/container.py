@@ -1,68 +1,65 @@
-"""显式依赖容器：持有配置与 Database，统一管理运行期对象的生命周期。"""
+"""Composition root for the process-level inbound-mail dependencies."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import structlog
 
-from app.core.ingest import IngestCoordinator
 from app.core.settings import AppConfig
+from app.db.email_sync_store import SqlAlchemyEmailSyncStore
 from app.db.engine import Database, build_database
 from app.observability import configure_logging
-from app.services.email import EmailService
+from app.ports import EmailSyncStore, InboundMailbox
+from app.providers.email.imap_reader import ImapMailboxReader
+from app.providers.email.registry import create_client
+from app.services.ingest import IngestCoordinator, IngestPolicy
 
 
+@dataclass(slots=True)
 class Container:
-    """全局对象容器：构造时装配 Database、EmailService 与 IngestCoordinator，生命周期统一接管。
+    """Already-wired runtime dependencies for one CLI/API process.
 
-    引擎/会话工厂不设模块级全局单例；业务层经 ``container.database.session()``
-    获取事务性会话。``EmailService`` 仅负责读邮件，``IngestCoordinator`` 负责读+落库的编排。
+    This type performs no business work. ``build_container`` is the one place
+    that chooses production adapter implementations; tests can construct this
+    dataclass with fakes instead.
     """
 
-    def __init__(self, config: AppConfig) -> None:
-        self._config = config
-
-        # 结构化日志：构造时一次性配置，后续所有 logging/structlog 调用输出 JSON
-        configure_logging(self._config.log_level)
-        self._logger = structlog.get_logger("email-agent")
-
-        # Database 仅在构造时装配一次，连接到首次使用才真正建立
-        self._database = build_database(config)
-
-        # EmailService
-        self._email = EmailService()
-
-        # IngestCoordinator 持有 DB 操作权，编排“读取→落库”
-        self._coordinator = IngestCoordinator(
-            database=self._database,
-            email_reader=self._email,
-            config=self._config,
-        )
-
-    @property
-    def config(self) -> AppConfig:
-        """返回全局配置，CLI 与业务层据此读取环境变量驱动的参数。"""
-        return self._config
-
-    @property
-    def database(self) -> Database:
-        """返回进程内唯一的 Database 门面，异步上下文中经它开事务。"""
-        return self._database
-
-    @property
-    def email(self) -> EmailService:
-        """返回邮件读取服务实例。"""
-        return self._email
-
-    @property
-    def coordinator(self) -> IngestCoordinator:
-        """返回邮件同步编排器实例。"""
-        return self._coordinator
-
-    @property
-    def logger(self):
-        """返回已配置的结构化日志记录器，cli 与业务层经它输出 JSON 日志。"""
-        return self._logger
+    config: AppConfig
+    logger: Any
+    database: Database
+    inbox: InboundMailbox
+    sync_store: EmailSyncStore
+    mail_sync: IngestCoordinator
 
     async def close_all(self) -> None:
-        """释放 Database 持有的全部连接；同步入口（如 CLI）负责用 asyncio.run 桥接。"""
-        await self._database.dispose()
+        """Release resources owned by this process-level composition root."""
+
+        await self.database.dispose()
+
+
+def build_container(config: AppConfig) -> Container:
+    """Wire the concrete IMAP and SQLAlchemy adapters into application services."""
+
+    configure_logging(config.log_level)
+    logger = structlog.get_logger("email-agent")
+    database = build_database(config)
+    inbox = ImapMailboxReader(client_factory=create_client)
+    sync_store = SqlAlchemyEmailSyncStore(database)
+    mail_sync = IngestCoordinator(
+        inbox=inbox,
+        store=sync_store,
+        policy=IngestPolicy(
+            max_workers=config.sync_max_workers,
+            timeout_seconds=config.sync_timeout_seconds,
+        ),
+    )
+    return Container(
+        config=config,
+        logger=logger,
+        database=database,
+        inbox=inbox,
+        sync_store=sync_store,
+        mail_sync=mail_sync,
+    )

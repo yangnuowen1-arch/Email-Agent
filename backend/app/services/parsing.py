@@ -6,7 +6,7 @@ from email.header import decode_header
 from email.message import EmailMessage as StdEmailMessage
 from email.utils import getaddresses, parsedate_to_datetime
 
-from app.schemas import EmailData, RawEmail
+from app.schemas import ParsedEmail, RawEmail
 
 
 def _decode_subject(msg: StdEmailMessage) -> str:
@@ -214,8 +214,8 @@ def _extract_bodies(msg: StdEmailMessage) -> tuple[str | None, str | None]:
     return text_body, html_body
 
 
-def parse_email(raw_email: RawEmail) -> EmailData:
-    """将原始 RFC822 字节解析为领域数据 :class:`EmailData`。
+def parse_email(raw_email: RawEmail) -> ParsedEmail:
+    """将原始 RFC822 字节解析为领域数据 :class:`ParsedEmail`。
 
     纯函数：无 I/O、无全局状态，便于单测和并发调用。
     """
@@ -233,14 +233,14 @@ def parse_email(raw_email: RawEmail) -> EmailData:
 
     # 空字节直接返回默认值，符合规范中“空邮件容错”的约定
     if not raw:
-        return EmailData(account_id=account_id, uid=uid)
+        return ParsedEmail(account_id=account_id, uid=uid)
 
     try:
         # 使用 policy=default 解析，确保得到结构化的 EmailMessage 对象
         emsg = email.message_from_bytes(raw, policy=policy.default)
     except Exception:
         # 解析完全失败时返回默认值，避免整批同步因单封邮件异常而中断
-        return EmailData(account_id=account_id, uid=uid)
+        return ParsedEmail(account_id=account_id, uid=uid)
 
     # 依次提取各字段，每步均有容错逻辑
     subject = _decode_subject(emsg)
@@ -256,7 +256,7 @@ def parse_email(raw_email: RawEmail) -> EmailData:
     text_body, html_body = _extract_bodies(emsg)
 
     # 组装领域数据返回
-    return EmailData(
+    return ParsedEmail(
         account_id=account_id,
         uid=uid,
         message_id=message_id,

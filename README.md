@@ -1,10 +1,12 @@
 # Email-Agent
 
-从 PostgreSQL 读取邮箱账号配置，通过 IMAP 增量拉取邮件，解析后写回 PostgreSQL。
+当前可运行能力是：从 PostgreSQL 读取邮箱账号配置，通过 IMAP 增量拉取邮件，解析后写回 PostgreSQL。
 
 ```
 email_accounts → IMAP → 解析邮件 → emails → 更新 last_sync_uid
 ```
+
+产品目标还包括 LLM 邮件理解、回复草稿和人工审批后的 SMTP 外发；这些能力尚未接入当前运行入口。架构边界与分阶段计划见 [docs/architecture.md](docs/architecture.md)。
 
 ## 环境要求
 
@@ -98,7 +100,7 @@ ORDER BY id;
 
 | 参数 | 说明 |
 |---|---|
-| `ingest` | 仅拉取 UID 大于 `last_sync_uid` 的新邮件；成功后推进断点。 |
+| `ingest` | 仅拉取 UID 大于 `last_sync_uid` 的新邮件；所有选中邮件安全处理后才推进断点。 |
 | `--limit N` | 最多处理待拉取邮件中 UID 最小的 `N` 封。会写入邮件，但**不会**推进断点，因此适合调试，不适合正式同步。 |
 | `--full` | 忽略断点并扫描整个文件夹；成功后推进断点。邮箱邮件很多时请谨慎使用。 |
 | `--full --limit N` | 扫描全量范围但仅处理最旧的 `N` 封；不推进断点。 |
@@ -141,7 +143,7 @@ ORDER BY e.fetched_at DESC;
 
 再次运行同一条同步命令且没有新邮件时，应看到 `inserted=0`、`skipped=0`，这说明断点生效。
 
-注意：首次同步时 `last_sync_uid=0` 会拉取整个文件夹。建议用专门的测试邮箱，或先完成一次基线同步。`--limit 20` 不会推进断点，重复执行会再次拉取同一批候选邮件。
+注意：首次同步时 `last_sync_uid=0` 会拉取整个文件夹。建议用专门的测试邮箱，或先完成一次基线同步。`--limit 20` 不会推进断点，重复执行会再次拉取同一批候选邮件。若 IMAP 无法取回某个 UID，或该邮件无法解析，已成功的邮件仍可幂等入库，但该账号本轮不会推进断点，确保失败邮件下次可以重试。
 
 `fetched_at` 表示本程序何时拉取并入库；`sent_at` 来自邮件的 `Date` 头，可能受发件人时区或错误时间影响。
 
@@ -169,13 +171,14 @@ Email-Agent/
 ├── backend/
 │   └── app/                 # Python 包：import app
 │       ├── cli/             # 命令行入口
-│       ├── core/            # 配置与组合根
-│       ├── db/              # SQLAlchemy 引擎与 Session
-│       ├── models/          # ORM 数据契约
-│       ├── repository/      # 数据读写
-│       ├── providers/       # IMAP 等外部适配器
-│       ├── services/        # 解析和同步编排
-│       └── agent/           # LLM Agent 预留骨架
+│       ├── core/            # 配置与组合根（Container）
+│       ├── schemas/         # 不依赖 SDK/ORM 的数据契约
+│       ├── ports/           # Service 所需的外部能力 Protocol
+│       ├── services/        # 解析和同步等应用/领域逻辑
+│       ├── providers/       # IMAP 等协议适配器
+│       ├── db/              # SQLAlchemy 模型、Repository、存储适配器
+│       ├── llm/             # 后续 LLM gateway 边界
+│       └── memory/          # 后续运行状态/记忆边界
 ├── docs/
 ├── tests/
 ├── pyproject.toml

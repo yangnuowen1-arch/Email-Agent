@@ -1,2 +1,5 @@
-# 外部基础设施适配层的命名空间包。
-# 此处刻意不做任何子包导入：providers.email 的解耦测试要求导入该子包时不加载 ORM 模型。
+"""External infrastructure adapters, grouped by capability.
+
+Keep this namespace free of eager subpackage imports so a caller can import a
+contract without loading an unrelated SDK or persistence adapter.
+"""
