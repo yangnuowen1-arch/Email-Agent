@@ -49,6 +49,16 @@ DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/email_agent
 SYNC_MAX_WORKERS=5
 SYNC_TIMEOUT_SECONDS=60
 LOG_LEVEL=INFO
+
+# LLM 智能体（运行 agent 命令必填 LLM_API_KEY；其余可选）
+LLM_API_KEY=sk-xxx
+LLM_MODEL=hy3
+LLM_BASE_URL=https://opencode.ai/zen/go/v1
+LLM_TEMPERATURE=0.2
+LLM_MAX_TOKENS=4096
+LLM_TIMEOUT_SECONDS=120
+# 单个工具调用超时（可选，默认 30）
+AGENT_TOOL_TIMEOUT_SECONDS=30
 ```
 
 ### 4. 添加测试邮箱
@@ -86,35 +96,47 @@ ORDER BY id;
 | 目的 | 命令 |
 |---|---|
 | 查看帮助 | `uv run python -m app --help` |
-| 正常增量同步 | `uv run python -m app` |
-| 调试时最多拉取 20 封 | `uv run python -m app --limit 20` |
-| 忽略断点，全量同步 | `uv run python -m app --full` |
-| 已安装脚本入口 | `uv run email-agent` |
+| 增量同步（需 DATABASE_URL） | `uv run python -m app sync` |
+| 运行 agent 任务（仅需 LLM_API_KEY，不依赖数据库） | `uv run python -m app agent "你的任务"` |
+| 摘要最近邮件（需先 sync 落库） | `uv run python -m app agent "summarize my recent emails"` |
+| 已安装脚本入口 | `uv run email-agent --help` |
 
-`email-agent` 是命令名；`app` 是 Python 模块名。它们都指向同一个同步程序。
+`email-agent` 是命令名；`app` 是 Python 模块名。它们指向同一个 CLI 程序。注意：`python -m app` 不带子命令时只初始化容器后退出，**不会**再自动同步；同步必须显式使用 `sync` 子命令。
 
-### 参数说明
+### Agent 命令
 
-| 参数 | 说明 |
+`agent <task>` 是统一的自然语言入口：把任务交给 `EmailAgent`，由它按需调用已注册工具（如 `summarize_emails`）完成工作，并打印结果。
+
+- 邮件类任务（如摘要）需要先 `sync` 把邮件落库；agent 通过工具读取最近邮件再归纳。
+- `limit`、`account_id` 等由 LLM 从任务文本中解析后传给工具，无需额外命令行参数。
+- 无 `DATABASE_URL` 时仍可运行不依赖邮件的任务；若任务需要邮件但无数据库，工具会返回错误并由 LLM 如实说明。
+
+```bash
+# 摘要最近邮件（参数由 LLM 从自然语言解析）
+uv run python -m app agent "summarize my 5 most recent emails for account 3"
+
+# 其它通用任务
+uv run python -m app agent "写一封请假邮件，语气正式"
+```
+
+### 同步参数说明
+
+`sync` 子命令当前不接受命令行参数。增量范围由账号的 `last_sync_uid` 断点控制，并发数与超时由以下环境变量决定：
+
+| 变量 | 说明 |
 |---|---|
-| 无参数 | 仅拉取 UID 大于 `last_sync_uid` 的新邮件；成功后推进断点。 |
-| `--limit N` | 最多处理待拉取邮件中 UID 最小的 `N` 封。会写入邮件，但**不会**推进断点，因此适合调试，不适合正式同步。 |
-| `--full` | 忽略断点并扫描整个文件夹；成功后推进断点。邮箱邮件很多时请谨慎使用。 |
-| `--full --limit N` | 扫描全量范围但仅处理最旧的 `N` 封；不推进断点。 |
+| `SYNC_MAX_WORKERS` | 账号级并发数（对应线程池 max_workers）。 |
+| `SYNC_TIMEOUT_SECONDS` | 单账号同步超时，超时记为失败并隔离，不影响其他账号。 |
+
+重构前支持的 `--limit` / `--full` 调试参数已移除；如需限量调试，可临时调整账号的 `last_sync_uid`。
 
 程序输出类似：
 
 ```text
-Sync Summary (full=False, limit=None, total=1)
---------------------------------------------------------------------------------
-account              fetched inserted skipped  max_uid  status
---------------------------------------------------------------------------------
-test-mailbox (id=1)        1        1       0      105  OK
---------------------------------------------------------------------------------
-Total: 1 accounts, 1 fetched, 1 inserted, 0 failed
+inserted=1 skipped=0 failed=0 duration_ms=1234
 ```
 
-不要只看进程退出码：某个账号同步失败时，程序会继续处理其他账号。请检查汇总中的 `status` 和 `failed` 数量。
+不要只看进程退出码：某个账号同步失败时，程序会继续处理其他账号。请检查汇总中的 `failed` 数量。
 
 ## 验证今天的邮件同步
 
@@ -127,7 +149,7 @@ Total: 1 accounts, 1 fetched, 1 inserted, 0 failed
 然后运行正常增量同步：
 
 ```bash
-uv run python -m app
+uv run python -m app sync
 ```
 
 在 PostgreSQL 中确认这封邮件已写入。以下查询按上海自然日查看“今天被程序拉取”的邮件：
@@ -146,7 +168,7 @@ ORDER BY e.fetched_at DESC;
 
 再次运行同一条同步命令且没有新邮件时，应看到 `fetched=0`、`inserted=0`，这说明断点生效。
 
-注意：首次同步时 `last_sync_uid=0` 会拉取整个文件夹。建议用专门的测试邮箱，或先完成一次基线同步。`--limit 20` 不会推进断点，重复执行会再次拉取同一批候选邮件。
+注意：首次同步时 `last_sync_uid=0` 会拉取整个文件夹。建议用专门的测试邮箱，或先完成一次基线同步再按需增量。
 
 `fetched_at` 表示本程序何时拉取并入库；`sent_at` 来自邮件的 `Date` 头，可能受发件人时区或错误时间影响。
 
@@ -173,14 +195,14 @@ uv run ruff format backend/app tests
 Email-Agent/
 ├── backend/
 │   └── app/                 # Python 包：import app
-│       ├── cli/             # 命令行入口
-│       ├── core/            # 配置与组合根
-│       ├── db/              # SQLAlchemy 引擎与 Session
-│       ├── models/          # ORM 数据契约
-│       ├── repository/      # 数据读写
+│       ├── cli/             # 命令行入口（agent / sync 子命令）
+│       ├── core/            # 配置与组合根（Container）
+│       ├── db/              # SQLAlchemy 引擎、Session 与 ORM 模型、仓储
 │       ├── providers/       # IMAP 等外部适配器
 │       ├── services/        # 解析和同步编排
-│       └── agent/           # LLM Agent 预留骨架
+│       ├── tools/           # Agent 可调用的业务能力（含 ToolRegistry）
+│       ├── llm/             # LLM 网关抽象与 OpenAI 兼容实现
+│       └── agent/           # LangGraph 编排与提示词
 ├── docs/
 ├── tests/
 ├── pyproject.toml

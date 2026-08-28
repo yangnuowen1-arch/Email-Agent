@@ -1,20 +1,10 @@
-"""LLM gateway interfaces and concrete implementations."""
+"""LLM 层：工厂与异常，供 container / graph / cli 引用。"""
 
-from .base import (
-    ChatResponse,
-    LLMConfigurationError,
-    LLMError,
-    LLMGateway,
-    ToolCall,
-)
-from .gateway import OpenAIGateway, build_llm_gateway
+from .errors import LLMConfigurationError, LLMError
+from .factory import build_chat_model
 
 __all__ = [
-    "ChatResponse",
+    "build_chat_model",
     "LLMConfigurationError",
     "LLMError",
-    "LLMGateway",
-    "ToolCall",
-    "OpenAIGateway",
-    "build_llm_gateway",
 ]

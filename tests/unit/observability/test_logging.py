@@ -57,7 +57,7 @@ def test_configure_logging_outputs_valid_json():
 
 
 def test_configure_logging_formats_positional_args():
-    """验证 %-style 位置参数被正确格式化进 event 字符串（与 ingest.py 用法一致）。"""
+    """验证 %-style 位置参数被正确格式化进 event 字符串（与 sync.py 用法一致）。"""
     configure_logging("INFO")
 
     handler = _configured_handler()
@@ -66,14 +66,14 @@ def test_configure_logging_formats_positional_args():
         level=logging.INFO,
         pathname="test_logging.py",
         lineno=1,
-        msg="ingest failed for %s (id=%s)",
+        msg="sync failed for %s (id=%s)",
         args=("myaccount", 42),
         exc_info=None,
     )
     formatted = handler.format(record)
     parsed = json.loads(formatted)
 
-    assert parsed["event"] == "ingest failed for myaccount (id=42)"
+    assert parsed["event"] == "sync failed for myaccount (id=42)"
 
 
 def test_configure_logging_is_idempotent():

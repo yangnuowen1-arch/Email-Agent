@@ -1,6 +1,6 @@
 import pytest
 
-from app.core.settings import AppConfig
+from app.core.settings import AppConfig, LLMConfig
 
 
 @pytest.fixture(autouse=True)
@@ -79,3 +79,17 @@ def test_from_env_negative_timeout_raises(monkeypatch):
     monkeypatch.setenv("SYNC_TIMEOUT_SECONDS", "-1")
     with pytest.raises(ValueError, match="SYNC_TIMEOUT_SECONDS"):
         AppConfig.from_env()
+
+
+def test_from_env_without_database_url_when_not_required(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = AppConfig.from_env(require_database=False)
+    assert cfg.database_url == ""
+    assert isinstance(cfg.llm, LLMConfig)
+
+
+def test_from_env_requires_database_url_by_default(monkeypatch):
+    # 默认仍强制要求 DATABASE_URL，保持既有语义
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with pytest.raises(ValueError, match="DATABASE_URL"):
+        AppConfig.from_env(require_database=True)

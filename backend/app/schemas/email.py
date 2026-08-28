@@ -14,6 +14,7 @@ class ParsedEmail:
 
     account_id: int
     uid: int
+    id: int | None = None
     message_id: str | None = None
     subject: str = ""
     sender: str | None = None
@@ -21,7 +22,9 @@ class ParsedEmail:
     sent_at: datetime | None = None
     text_body: str | None = None
     html_body: str | None = None
+    is_read: bool = False
     fetched_at: datetime | None = None
+    analysis: dict | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -51,7 +54,7 @@ class BatchResult:
 class AccountSpec:
     """供 services / providers 使用的账号只读视图（解耦 services 与 db）。
 
-    由 ``core.ingest._to_spec`` 从 ORM ``Account`` 投影而来；字段与
+    由 ``core.sync._to_account_spec`` 从 ORM ``Account`` 投影而来；字段与
     ``schemas.account.AccountConfig`` 高度重合，使 provider 客户端无需认识持久化模型。
     """
 
@@ -96,4 +99,5 @@ class EmailData:
     sent_at: datetime | None = None
     text_body: str | None = None
     html_body: str | None = None
+    is_read: bool = False
     fetched_at: datetime | None = None

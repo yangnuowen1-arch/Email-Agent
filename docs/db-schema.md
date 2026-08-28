@@ -9,10 +9,16 @@ email_accounts (1) ──────< (N) emails
      │                        │
  账号配置(输入)            已拉取邮件(输出)
      └── last_sync_uid ──────┘  ← 断点续传的桥梁
+                                │
+                                ▼
+                          email_analyses
+                          结构化分析(输出)
+                          ← email_id 唯一
 ```
 
 - 一条 `email_accounts` 记录对应一个真实邮箱，是程序的唯一输入源。
 - `emails.account_id` 外键关联到账号，`(account_id, uid)` 唯一约束保证同一邮箱内邮件不重复入库。
+- `email_analyses.email_id` 唯一约束保证一封邮件至多一份分析结果，支撑 `ON CONFLICT (email_id) DO UPDATE` 幂等重跑。
 
 ## 2. 表结构
 
@@ -86,6 +92,7 @@ CREATE TABLE emails (
     sent_at     TIMESTAMPTZ,
     text_body   TEXT,
     html_body   TEXT,
+    is_read     BOOL NOT NULL DEFAULT FALSE,
     fetched_at  TIMESTAMPTZ DEFAULT now(),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -103,6 +110,7 @@ COMMENT ON COLUMN emails.recipients IS '收件人列表（to + cc 合并存储�
 COMMENT ON COLUMN emails.sent_at IS '邮件 Date 头解析结果';
 COMMENT ON COLUMN emails.text_body IS '纯文本正文';
 COMMENT ON COLUMN emails.html_body IS 'HTML 正文；与 text_body 至少一个非空';
+COMMENT ON COLUMN emails.is_read IS '是否已处理（agent 读取后置 TRUE）；FALSE 表示未读';
 COMMENT ON COLUMN emails.fetched_at IS '本地拉取时间';
 COMMENT ON COLUMN emails.created_at IS '创建时间（UTC），插入后不可变';
 COMMENT ON COLUMN emails.updated_at IS '最后更新时间（UTC），随行更新刷新';
@@ -120,11 +128,100 @@ COMMENT ON COLUMN emails.updated_at IS '最后更新时间（UTC），随行更�
 | sent_at | TIMESTAMPTZ | 可空 | 邮件 Date 头解析结果 |
 | text_body | TEXT | 可空 | 纯文本正文 |
 | html_body | TEXT | 可空 | HTML 正文；与 text_body 至少一个非空 |
+| is_read | BOOL | NOT NULL, DEFAULT FALSE | 是否已处理（agent 读取后置 TRUE）；FALSE 表示未读 |
 | fetched_at | TIMESTAMPTZ | DEFAULT now() | 本地拉取时间 |
 | created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 创建时间（UTC），插入后不可变 |
 | updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 最后更新时间（UTC），随行更新刷新 |
 
 写入方式：批量 `INSERT ... ON CONFLICT (account_id, uid) DO NOTHING`。
+
+### 2.3 email_analyses — 邮件结构化分析表（输出）
+
+```sql
+CREATE TABLE email_analyses (
+    id                SERIAL PRIMARY KEY,
+    email_id          INT  NOT NULL UNIQUE,
+    account_id        INT  NOT NULL,
+    primary_intent    TEXT NOT NULL,
+    intents           JSONB NOT NULL DEFAULT '[]',
+    reasoning_summary TEXT NOT NULL DEFAULT '',
+    entities          JSONB NOT NULL DEFAULT '{}',
+    sentiment         TEXT NOT NULL DEFAULT 'neutral',
+    priority          TEXT NOT NULL DEFAULT 'P2',
+    suggested_tools   JSONB NOT NULL DEFAULT '[]',
+    status            TEXT NOT NULL DEFAULT 'analyzed',
+    error             TEXT,
+    model             TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE email_analyses IS '邮件结构化分析表（agent 节点 1 输出）';
+COMMENT ON COLUMN email_analyses.id IS '自增主键';
+COMMENT ON COLUMN email_analyses.email_id IS '分析对象邮件 ID，逻辑外键 → emails.id，唯一约束保证一封邮件至多一份分析';
+COMMENT ON COLUMN email_analyses.account_id IS '冗余存储所属账号，便于按账号查询分析结果';
+COMMENT ON COLUMN email_analyses.primary_intent IS '核心主意图，取值见「意图分类表」（如 cancel_order 取消订单/退订服务、refund_request 退款申请、meeting_request 会议/日程请求），未知时为 unknown_manual_review（无法判定，待人工复核）';
+COMMENT ON COLUMN email_analyses.intents IS '多意图列表，JSONB 数组，每项含 category（意图标识，取值见「意图分类表」，如 cancel_order 取消订单/退订服务）/confidence（置信度 0-1）/reasoning（推导依据），示例：[{"category":"cancel_order","confidence":0.95,"reasoning":"用户要求取消"}]';
+COMMENT ON COLUMN email_analyses.reasoning_summary IS 'AI 对整封邮件处理逻辑的全局综合判定总结';
+COMMENT ON COLUMN email_analyses.entities IS '提取的关键业务实体，JSONB 对象，示例：{"order_id":"ORD-123","date":"2026-08-28","amount":"128.00"}';
+COMMENT ON COLUMN email_analyses.sentiment IS '发件人情绪：positive / neutral / negative / angry / urgent';
+COMMENT ON COLUMN email_analyses.priority IS '处理优先级：P0（极紧急/故障）P1（高）P2（中）P3（低）';
+COMMENT ON COLUMN email_analyses.suggested_tools IS '建议后续调用的 Tool 函数名列表，JSONB 数组，示例：["summarize_emails"]';
+COMMENT ON COLUMN email_analyses.status IS '分析状态：analyzed（成功）/ failed（LLM 异常或解析失败）';
+COMMENT ON COLUMN email_analyses.error IS '失败原因，仅 status=failed 时非空';
+COMMENT ON COLUMN email_analyses.model IS '产出该分析的模型名（如 gpt-4o-mini），便于回溯';
+COMMENT ON COLUMN email_analyses.created_at IS '首次分析时间';
+COMMENT ON COLUMN email_analyses.updated_at IS '最后更新时间，ON CONFLICT DO UPDATE 时刷新';
+
+-- 唯一索引由 UNIQUE 约束自动创建，写入方式：
+-- INSERT INTO email_analyses (...) VALUES (...)
+-- ON CONFLICT (email_id) DO UPDATE SET ...;
+```
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | SERIAL | PK | 自增主键 |
+| email_id | INT | NOT NULL, UNIQUE | 分析对象邮件 ID，逻辑外键 → emails.id |
+| account_id | INT | NOT NULL | 冗余所属账号，便于按账号查询 |
+| primary_intent | TEXT | NOT NULL | 核心主意图（见意图分类表），用于路由；未知为 unknown_manual_review（无法判定，待人工复核） |
+| intents | JSONB | NOT NULL, DEFAULT '[]' | 多意图列表，每项含 category（见意图分类表）/confidence/reasoning |
+| reasoning_summary | TEXT | NOT NULL, DEFAULT '' | AI 全局综合判定总结 |
+| entities | JSONB | NOT NULL, DEFAULT '{}' | 提取的关键业务实体（order_id/date/amount 等） |
+| sentiment | TEXT | NOT NULL, DEFAULT 'neutral' | 发件人情绪：positive/neutral/negative/angry/urgent |
+| priority | TEXT | NOT NULL, DEFAULT 'P2' | 处理优先级：P0/P1/P2/P3 |
+| suggested_tools | JSONB | NOT NULL, DEFAULT '[]' | 建议调用的 Tool 名列表 |
+| status | TEXT | NOT NULL, DEFAULT 'analyzed' | analyzed（成功）/ failed（异常） |
+| error | TEXT | 可空 | 失败原因，仅 status=failed 时非空 |
+| model | TEXT | 可空 | 产出分析的模型名，便于回溯 |
+| created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 首次分析时间 |
+| updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 最后更新时间，ON CONFLICT DO UPDATE 时刷新 |
+
+写入方式：`INSERT ... ON CONFLICT (email_id) DO UPDATE`，支持重跑幂等。
+
+### 2.4 意图分类表（intent categories）
+
+> 英文标识是代码中的枚举值（`app/schemas/analysis.py` 的 `ALL_INTENTS`，单一来源），
+> LLM 输出必须从本表选择；白名单外值校验失败 → 分析走 fallback（status=failed）。
+> 新增意图先扩展代码常量，再同步本表。
+
+| 英文标识 | 中文含义 | 场景分组 |
+|---|---|---|
+| cancel_order | 取消订单/退订服务 | ToC（消费者） |
+| refund_request | 退款申请 | ToC（消费者） |
+| order_status_query | 订单状态查询/物流追踪 | ToC（消费者） |
+| invoice_query | 发票/账单查询 | ToC（消费者） |
+| meeting_request | 会议/日程请求 | ToC（消费者） |
+| complaint | 投诉/不满表达 | ToC（消费者） |
+| spam_or_notice | 垃圾邮件/系统通知/广告 | ToC（消费者） |
+| other | 无法归类的消费者意图 | ToC（消费者） |
+| contract | 合同/协议相关 | ToB（企业） |
+| payment | 付款/结算相关 | ToB（企业） |
+| partnership | 合作/商务洽谈 | ToB（企业） |
+| technical_issue | 技术问题/故障报告 | ToB（企业） |
+| account_management | 账号/权限管理 | ToB（企业） |
+| unknown_manual_review | 无法判定，待人工复核 | 兜底 |
+
+`primary_intent` 与 `intents[].category` 均取本表枚举值。
 
 ## 3. 设计说明
 
@@ -140,6 +237,12 @@ COMMENT ON COLUMN emails.updated_at IS '最后更新时间（UTC），随行更�
 2. 仅拉取 `UID > N` 的邮件；
 3. 本批全部成功入库后，将 `last_sync_uid` 更新为本批最大 UID、刷新 `last_sync_at`；
 4. 中途失败则不推进断点，下次重拉（配合 ON CONFLICT 幂等，重拉无副作用）。
+
+### 为什么分析状态独立成表而不是加 `emails.status`？
+
+- `emails` 属于同步层产物，保持只追加语义（sync 写入后不修改），便于独立排查同步问题。
+- 分析与邮件是 1:1 关系，独立成表支持重跑幂等（`ON CONFLICT (email_id) DO UPDATE`）和模型版本追溯。
+- 分析状态（analyzed/failed）与邮件已读语义（`is_read`）职责不同：`is_read` 标记 agent 是否已读取处理，`status` 标记分析流程本身是否成功。
 
 ## 4. 变更记录
 
@@ -160,3 +263,43 @@ COMMENT ON COLUMN emails.updated_at IS '最后更新时间（UTC），随行更�
 `repository/` 改为基于 `Session` 的薄封装（同一账号的邮件入库与断点推进共享一个 Session，由一次 `commit()` 原子提交）。
 **本变更不修改任何表结构、约束或列定义**，原有 DDL（含 `(account_id, uid)` 唯一约束）保持不变，幂等写入改为 `pg_insert(...).on_conflict_do_nothing()`。
 驱动统一使用 psycopg v3（连接串 `postgresql+psycopg://`），不再兼容 psycopg2。
+
+### 2026-08-28 emails 表新增 is_read 列（支持未读语义）
+
+```sql
+ALTER TABLE emails ADD COLUMN is_read BOOLEAN NOT NULL DEFAULT FALSE;
+COMMENT ON COLUMN emails.is_read IS '是否已处理（agent 读取后置 TRUE）；FALSE 表示未读';
+```
+
+用于标记邮件是否已被 agent 读取处理：sync 落库时默认未读，agent 上下文注入后标记为已读。
+
+### 2026-08-28 新增 email_analyses 表（邮件结构化分析）
+
+```sql
+CREATE TABLE email_analyses (
+    id                SERIAL PRIMARY KEY,
+    email_id          INT  NOT NULL UNIQUE,
+    account_id        INT  NOT NULL,
+    primary_intent    TEXT NOT NULL,
+    intents           JSONB NOT NULL DEFAULT '[]',
+    reasoning_summary TEXT NOT NULL DEFAULT '',
+    entities          JSONB NOT NULL DEFAULT '{}',
+    sentiment         TEXT NOT NULL DEFAULT 'neutral',
+    priority          TEXT NOT NULL DEFAULT 'P2',
+    suggested_tools   JSONB NOT NULL DEFAULT '[]',
+    status            TEXT NOT NULL DEFAULT 'analyzed',
+    error             TEXT,
+    model             TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+邮件结构化分析表，作为 agent 节点 1（邮件预处理与意图分析）的持久化输出。DDL 与字段注释见 §2.3。
+
+### 2026-08-28 意图分类标准化：枚举常量单一来源 + 注释中文化（无表结构变更）
+
+- 意图/情绪/优先级枚举收敛为代码单一来源（`app/schemas/analysis.py`），prompt 生成与 db 层白名单校验均引用该处。
+- `primary_intent`/`intents[].category` 改为白名单强校验：LLM 输出白名单外意图时校验失败 → 分析走 fallback（status=failed）。
+- `email_analyses` 的 `primary_intent`/`intents` 列注释补充中文含义，新增「意图分类表」见 §2.4。
+- **无任何表结构、约束或列定义变更，DDL 无需执行。**

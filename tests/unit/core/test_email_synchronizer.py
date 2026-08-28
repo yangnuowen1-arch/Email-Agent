@@ -1,12 +1,12 @@
-"""core.ingest.IngestCoordinator 单元测试：编排读+落库，账号级失败隔离。"""
+"""core.sync.EmailSynchronizer 单元测试：编排读+落库，账号级失败隔离。"""
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
-from app.core.ingest import IngestCoordinator
 from app.core.settings import AppConfig
+from app.core.sync import EmailSynchronizer
 from app.db.db import Account
 from app.schemas import EmailData
 
@@ -70,13 +70,14 @@ def _mock_session(accounts):
     return session
 
 
-async def test_ingest_accounts_persists_and_advances_checkpoint():
+async def test_sync_accounts_persists_and_advances_checkpoint():
     account = _account(last_sync_uid=5)
     session = _mock_session([account])
     reader = FakeReader({1: _messages(6, 7, 8)})  # max_uid=8 > 5 → 推进断点
-    coordinator = IngestCoordinator(FakeDatabase(session), reader, _config())
+    synchronizer = EmailSynchronizer(FakeDatabase(session), reader, _config())
 
-    report = await coordinator.ingest_accounts()
+    # limit=None 表示不限量全量同步，按设计会推进账号断点
+    report = await synchronizer.sync_accounts(limit=None)
 
     assert report.total_inserted == 2
     assert report.total_skipped == 1  # 3 解析 - 2 插入
@@ -86,26 +87,26 @@ async def test_ingest_accounts_persists_and_advances_checkpoint():
     assert session.execute.await_count == 2
 
 
-async def test_ingest_accounts_limit_mode_does_not_advance_checkpoint():
+async def test_sync_accounts_limit_mode_does_not_advance_checkpoint():
     account = _account(last_sync_uid=5)
     session = _mock_session([account])
     reader = FakeReader({1: _messages(6, 7, 8)})
-    coordinator = IngestCoordinator(FakeDatabase(session), reader, _config())
+    synchronizer = EmailSynchronizer(FakeDatabase(session), reader, _config())
 
-    report = await coordinator.ingest_accounts(limit=10)
+    report = await synchronizer.sync_accounts(limit=10)
 
     assert report.total_inserted == 2
     # 限量模式不推进断点：仅 bulk_create 一次 execute
     assert session.execute.await_count == 1
 
 
-async def test_ingest_accounts_isolates_per_account_failure():
+async def test_sync_accounts_isolates_per_account_failure():
     accounts = [_account(1), _account(2)]
     session = _mock_session(accounts)
     reader = FakeReader({1: _messages(6), 2: RuntimeError("read boom")})
-    coordinator = IngestCoordinator(FakeDatabase(session), reader, _config())
+    synchronizer = EmailSynchronizer(FakeDatabase(session), reader, _config())
 
-    report = await coordinator.ingest_accounts()
+    report = await synchronizer.sync_accounts()
 
     assert report.total_failed == 1
     assert report.total_inserted == 2  # 仅账号 1 成功
@@ -114,13 +115,13 @@ async def test_ingest_accounts_isolates_per_account_failure():
     assert "read boom" in failed[0].error
 
 
-async def test_ingest_accounts_empty_messages_does_not_write():
+async def test_sync_accounts_empty_messages_does_not_write():
     account = _account()
     session = _mock_session([account])
     reader = FakeReader({1: []})
-    coordinator = IngestCoordinator(FakeDatabase(session), reader, _config())
+    synchronizer = EmailSynchronizer(FakeDatabase(session), reader, _config())
 
-    report = await coordinator.ingest_accounts()
+    report = await synchronizer.sync_accounts()
 
     assert report.total_inserted == 0
     assert report.total_failed == 0

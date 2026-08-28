@@ -19,7 +19,10 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
+
+from app.schemas.analysis import ALL_INTENTS, PRIORITIES, SENTIMENTS, UNKNOWN_INTENT
 
 
 class Base(DeclarativeBase):
@@ -181,6 +184,8 @@ class EmailMessage(Base):
     text_body: Mapped[str | None] = mapped_column(Text)
     # HTML 正文
     html_body: Mapped[str | None] = mapped_column(Text)
+    # 是否已处理（agent 读取后置 TRUE），默认未读
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # 本地拉取时间，默认为当前 UTC 时间
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=_now_utc)
 
@@ -197,6 +202,7 @@ class EmailMessage(Base):
         sent_at: datetime | None = None,
         text_body: str | None = None,
         html_body: str | None = None,
+        is_read: bool = False,
         fetched_at: datetime | None = None,
     ) -> None:
         """构造后校验与容错归一：确保核心字段类型正确，缺失字段给予默认值。"""
@@ -230,6 +236,7 @@ class EmailMessage(Base):
         self.sent_at = sent_at
         self.text_body = text_body
         self.html_body = html_body
+        self.is_read = is_read
         # fetched_at 缺省时按构造时间填充（与入库时间一致）
         self.fetched_at = fetched_at if fetched_at is not None else _now_utc()
 
@@ -264,3 +271,111 @@ class EmailMessage(Base):
             msg = "recipients must be list[str]"
             raise TypeError(msg)
         return value
+
+
+# ---------------------------------------------------------------------------
+# 邮件结构化分析模型
+# ---------------------------------------------------------------------------
+
+_VALID_SENTIMENTS = set(SENTIMENTS)
+_VALID_PRIORITIES = set(PRIORITIES)
+_VALID_STATUSES = {"analyzed", "failed"}
+_VALID_INTENTS = set(ALL_INTENTS)
+
+
+class EmailAnalysis(Base):
+    """邮件结构化分析 ORM 模型，对应数据库 email_analyses 表的一行。
+
+    一封邮件至多一份分析结果（email_id UNIQUE），由 agent 节点 1 写入。
+    """
+
+    __tablename__ = "email_analyses"
+    __table_args__ = (UniqueConstraint("email_id", name="email_analyses_email_id_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 分析对象邮件 ID，唯一约束支撑 ON CONFLICT DO UPDATE 幂等重跑
+    email_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 冗余所属账号，便于按账号查询分析结果
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 核心主意图，用于后续路由；未知时为 UNKNOWN_INTENT
+    primary_intent: Mapped[str] = mapped_column(String, default=UNKNOWN_INTENT)
+    # 多意图列表：[{"category": "...", "confidence": 0.95, "reasoning": "..."}]
+    intents: Mapped[list] = mapped_column(JSONB, default=list)
+    # AI 全局综合判定总结
+    reasoning_summary: Mapped[str] = mapped_column(Text, default="")
+    # 提取的关键业务实体：{"order_id": "...", "date": "..."}
+    entities: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # 发件人情绪
+    sentiment: Mapped[str] = mapped_column(String, default="neutral")
+    # 处理优先级
+    priority: Mapped[str] = mapped_column(String, default="P2")
+    # 建议调用的 Tool 名列表
+    suggested_tools: Mapped[list] = mapped_column(JSONB, default=list)
+    # 分析状态：analyzed / failed
+    status: Mapped[str] = mapped_column(String, default="analyzed")
+    # 失败原因，仅 status=failed 时非空
+    error: Mapped[str | None] = mapped_column(Text)
+    # 产出分析的模型名
+    model: Mapped[str | None] = mapped_column("model", String)
+    # 首次分析时间
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc, nullable=False
+    )
+    # 最后更新时间，ON CONFLICT DO UPDATE 时刷新
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc, onupdate=_now_utc, nullable=False
+    )
+
+    def __init__(
+        self,
+        *,
+        id: int | None = None,
+        email_id: int,
+        account_id: int,
+        primary_intent: str = UNKNOWN_INTENT,
+        intents: list | None = None,
+        reasoning_summary: str = "",
+        entities: dict | None = None,
+        sentiment: str = "neutral",
+        priority: str = "P2",
+        suggested_tools: list | None = None,
+        status: str = "analyzed",
+        error: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        """构造后校验：确保白名单字段值合法，必填字段非空。"""
+        if not isinstance(email_id, int) or email_id <= 0:
+            msg = f"email_id must be positive int, got {email_id!r}"
+            raise ValueError(msg)
+        if not isinstance(account_id, int) or account_id <= 0:
+            msg = f"account_id must be positive int, got {account_id!r}"
+            raise ValueError(msg)
+        if sentiment not in _VALID_SENTIMENTS:
+            msg = f"sentiment must be one of {sorted(_VALID_SENTIMENTS)}, got {sentiment!r}"
+            raise ValueError(msg)
+        if priority not in _VALID_PRIORITIES:
+            msg = f"priority must be one of {sorted(_VALID_PRIORITIES)}, got {priority!r}"
+            raise ValueError(msg)
+        if primary_intent not in _VALID_INTENTS:
+            msg = f"primary_intent must be one of {sorted(_VALID_INTENTS)}, got {primary_intent!r}"
+            raise ValueError(msg)
+        if status not in _VALID_STATUSES:
+            msg = f"status must be one of {sorted(_VALID_STATUSES)}, got {status!r}"
+            raise ValueError(msg)
+        if status == "failed" and not error:
+            msg = "status='failed' requires non-empty error"
+            raise ValueError(msg)
+
+        self.id = id  # type: ignore[assignment]
+        self.email_id = email_id
+        self.account_id = account_id
+        self.primary_intent = primary_intent
+        self.intents = intents if intents is not None else []
+        self.reasoning_summary = reasoning_summary
+        self.entities = entities if entities is not None else {}
+        self.sentiment = sentiment
+        self.priority = priority
+        self.suggested_tools = suggested_tools if suggested_tools is not None else []
+        self.status = status
+        self.error = error
+        self.model = model

@@ -33,7 +33,9 @@ class EmailService:
         self._client_factory = client_factory
         self._parser = parser
 
-    async def read(self, account: AccountSpec, *, full: bool = False, limit=None) -> list[EmailData]:
+    async def read(
+        self, account: AccountSpec, *, full: bool = False, limit=None
+    ) -> list[EmailData]:
         """拉取并解析指定账号的邮件，返回解析后的邮件数据列表。
 
         阻塞的 IMAP 调用通过事件循环的默认线程池执行，避免阻塞主循环；解析失败

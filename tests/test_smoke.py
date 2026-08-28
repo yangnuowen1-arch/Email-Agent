@@ -32,5 +32,6 @@ def test_cli_help_exits_zero() -> None:
 
     assert result.returncode == 0
 
-    # 新设计：无 CLI 参数，同步能力以子命令暴露
-    assert "ingest" in result.stdout
+    # 新设计：统一 agent 入口 + sync 数据摄入，均以子命令暴露
+    assert "agent" in result.stdout
+    assert "sync" in result.stdout

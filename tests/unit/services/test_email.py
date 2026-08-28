@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from app.providers.email.base import MailClientError
 from app.schemas import AccountSpec, EmailData, RawEmail
 from app.services.email import EmailService
@@ -75,7 +77,7 @@ async def test_read_propagates_mail_client_error():
     service = EmailService(client_factory=lambda account: _BoomClient(account, _VALID_RAW))
     try:
         await service.read(_spec(), full=True)
-        assert False, "expected MailClientError"
+        pytest.fail("expected MailClientError")
     except MailClientError:
         pass
 
@@ -84,6 +86,6 @@ async def test_read_rejects_bad_limit():
     service = EmailService(client_factory=_factory(_VALID_RAW))
     try:
         await service.read(_spec(), limit=0)
-        assert False, "expected ValueError"
+        pytest.fail("expected ValueError")
     except ValueError:
         pass

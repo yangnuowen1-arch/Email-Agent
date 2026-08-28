@@ -127,7 +127,9 @@ class TestEmailRepository:
 
     async def test_get_email_composite_key(self):
         mock_session = self._mock_session()
-        mock_session.scalar = AsyncMock(return_value=EmailMessage(account_id=1, uid=100, subject="hi"))
+        mock_session.scalar = AsyncMock(
+            return_value=EmailMessage(account_id=1, uid=100, subject="hi")
+        )
 
         repo = EmailRepository(mock_session)
         found = await repo.get_email(account_id=1, uid=100)
@@ -178,7 +180,9 @@ class TestEmailRepository:
     async def test_bulk_builds_pg_insert_statement(self):
         """验证 bulk_create_email 组装 PG 方言的 ON CONFLICT DO NOTHING 语句。"""
         mock_session = self._mock_session()
-        mock_session.execute = AsyncMock(return_value=MagicMock(fetchall=MagicMock(return_value=[1, 2])))
+        mock_session.execute = AsyncMock(
+            return_value=MagicMock(fetchall=MagicMock(return_value=[1, 2]))
+        )
 
         repo = EmailRepository(mock_session)
         msgs = [
