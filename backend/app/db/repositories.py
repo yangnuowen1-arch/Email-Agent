@@ -8,11 +8,20 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import case, delete, select, update
+from sqlalchemy import case, delete, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.schemas.mail_query import MailSearchCriteria
+
 from .db import Account, EmailMessage
+
+
+def _contains_pattern(value: str) -> str:
+    """Escape SQL LIKE metacharacters before performing a literal contains search."""
+
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 class EmailAccountRepository:
@@ -108,11 +117,76 @@ class EmailRepository:
 
     async def list_email_by_account_id(self, account_id: int) -> list[EmailMessage]:
         """按账号查询邮件列表。"""
-        stmt = select(EmailMessage).where(
-            EmailMessage.account_id == account_id,
-        ).order_by(EmailMessage.id)
+        stmt = (
+            select(EmailMessage)
+            .where(
+                EmailMessage.account_id == account_id,
+            )
+            .order_by(EmailMessage.id)
+        )
         result = await self.session.scalars(stmt)
         return list(result.all())
+
+    async def search_emails(
+        self,
+        criteria: MailSearchCriteria,
+        *,
+        allowed_account_ids: frozenset[int],
+    ) -> list[EmailMessage]:
+        """Search only within a trusted account scope.
+
+        The scope predicate lives in this query itself so callers cannot fetch a
+        row first and accidentally perform authorization after the fact.
+        """
+
+        if not allowed_account_ids:
+            return []
+
+        filters = [EmailMessage.account_id.in_(allowed_account_ids)]
+        if criteria.account_id is not None:
+            filters.append(EmailMessage.account_id == criteria.account_id)
+        if criteria.text:
+            pattern = _contains_pattern(criteria.text)
+            filters.append(
+                or_(
+                    EmailMessage.subject.ilike(pattern, escape="\\"),
+                    EmailMessage.sender.ilike(pattern, escape="\\"),
+                    EmailMessage.text_body.ilike(pattern, escape="\\"),
+                )
+            )
+        if criteria.sender:
+            sender_pattern = _contains_pattern(criteria.sender)
+            filters.append(EmailMessage.sender.ilike(sender_pattern, escape="\\"))
+
+        stmt = (
+            select(EmailMessage)
+            .where(*filters)
+            .order_by(
+                EmailMessage.sent_at.is_(None),
+                EmailMessage.sent_at.desc(),
+                EmailMessage.id.desc(),
+            )
+            .limit(criteria.limit)
+        )
+        result = await self.session.scalars(stmt)
+        return list(result.all())
+
+    async def get_email_by_id_in_accounts(
+        self,
+        email_id: int,
+        *,
+        allowed_account_ids: frozenset[int],
+    ) -> EmailMessage | None:
+        """Return a mail only when its account is inside the supplied scope."""
+
+        if not allowed_account_ids:
+            return None
+
+        stmt = select(EmailMessage).where(
+            EmailMessage.id == email_id,
+            EmailMessage.account_id.in_(allowed_account_ids),
+        )
+        return await self.session.scalar(stmt)
 
     async def create_email(self, message: EmailMessage) -> EmailMessage:
         """插入单封邮件，flush 后返回带主键的实体。"""
@@ -136,18 +210,20 @@ class EmailRepository:
                 raise TypeError(msg)
 
             fetched_at = m.fetched_at or datetime.now(UTC)
-            values.append({
-                "account_id": m.account_id,
-                "uid": m.uid,
-                "message_id": m.message_id,
-                "subject": m.subject,
-                "sender": m.sender,
-                "recipients": m.recipients,
-                "sent_at": m.sent_at,
-                "text_body": m.text_body,
-                "html_body": m.html_body,
-                "fetched_at": fetched_at,
-            })
+            values.append(
+                {
+                    "account_id": m.account_id,
+                    "uid": m.uid,
+                    "message_id": m.message_id,
+                    "subject": m.subject,
+                    "sender": m.sender,
+                    "recipients": m.recipients,
+                    "sent_at": m.sent_at,
+                    "text_body": m.text_body,
+                    "html_body": m.html_body,
+                    "fetched_at": fetched_at,
+                }
+            )
 
         stmt = (
             pg_insert(EmailMessage)

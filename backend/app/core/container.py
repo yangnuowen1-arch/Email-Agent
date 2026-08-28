@@ -8,13 +8,15 @@ from typing import Any
 import structlog
 
 from app.core.settings import AppConfig
+from app.db.email_query_store import SqlAlchemyMailQueryStore
 from app.db.email_sync_store import SqlAlchemyEmailSyncStore
 from app.db.engine import Database, build_database
 from app.observability import configure_logging
-from app.ports import EmailSyncStore, InboundMailbox
+from app.ports import EmailSyncStore, InboundMailbox, MailQueryStore
 from app.providers.email.imap_reader import ImapMailboxReader
 from app.providers.email.registry import create_client
 from app.services.ingest import IngestCoordinator, IngestPolicy
+from app.services.mail_query import MailQueryService
 
 
 @dataclass(slots=True)
@@ -32,6 +34,8 @@ class Container:
     inbox: InboundMailbox
     sync_store: EmailSyncStore
     mail_sync: IngestCoordinator
+    mail_query_store: MailQueryStore
+    mail_query: MailQueryService
 
     async def close_all(self) -> None:
         """Release resources owned by this process-level composition root."""
@@ -47,6 +51,7 @@ def build_container(config: AppConfig) -> Container:
     database = build_database(config)
     inbox = ImapMailboxReader(client_factory=create_client)
     sync_store = SqlAlchemyEmailSyncStore(database)
+    mail_query_store = SqlAlchemyMailQueryStore(database)
     mail_sync = IngestCoordinator(
         inbox=inbox,
         store=sync_store,
@@ -55,6 +60,7 @@ def build_container(config: AppConfig) -> Container:
             timeout_seconds=config.sync_timeout_seconds,
         ),
     )
+    mail_query = MailQueryService(mail_query_store)
     return Container(
         config=config,
         logger=logger,
@@ -62,4 +68,6 @@ def build_container(config: AppConfig) -> Container:
         inbox=inbox,
         sync_store=sync_store,
         mail_sync=mail_sync,
+        mail_query_store=mail_query_store,
+        mail_query=mail_query,
     )

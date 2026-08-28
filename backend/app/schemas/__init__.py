@@ -2,6 +2,7 @@
 
 from app.schemas.account import AccountConfig, AccountSpec
 from app.schemas.email import ParsedEmail, RawEmail
+from app.schemas.mail_query import MailContext, MailSearchCriteria, MailSearchItem
 from app.schemas.sync import (
     AccountSyncResult,
     MailboxReadResult,
@@ -15,6 +16,9 @@ __all__ = [
     "AccountSpec",
     "RawEmail",
     "ParsedEmail",
+    "MailContext",
+    "MailSearchCriteria",
+    "MailSearchItem",
     "AccountSyncResult",
     "MailboxReadResult",
     "PersistResult",

@@ -48,6 +48,7 @@ class Database:
         """释放底层引擎的连接池；由容器 ``close_all`` 统一调用。"""
         await self.engine.dispose()
 
+
 def build_database(config: AppConfig) -> Database:
     """按配置装配 Database。
 

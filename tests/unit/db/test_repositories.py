@@ -11,6 +11,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.db import Account, Base, EmailMessage
 from app.db.repositories import EmailAccountRepository, EmailRepository
+from app.schemas.mail_query import MailSearchCriteria
 
 
 @pytest.fixture
@@ -137,7 +138,9 @@ class TestEmailRepository:
 
     async def test_get_email_composite_key(self):
         mock_session = self._mock_session()
-        mock_session.scalar = AsyncMock(return_value=EmailMessage(account_id=1, uid=100, subject="hi"))
+        mock_session.scalar = AsyncMock(
+            return_value=EmailMessage(account_id=1, uid=100, subject="hi")
+        )
 
         repo = EmailRepository(mock_session)
         found = await repo.get_email(account_id=1, uid=100)
@@ -155,6 +158,30 @@ class TestEmailRepository:
 
         assert result == []
         mock_session.scalars.assert_awaited_once()
+
+    async def test_search_emails_scopes_the_database_query_to_allowed_accounts(self):
+        mock_session = self._mock_session()
+        mock_session.scalars = AsyncMock(return_value=MagicMock(all=MagicMock(return_value=[])))
+        repo = EmailRepository(mock_session)
+
+        await repo.search_emails(
+            MailSearchCriteria(text="quote", limit=5),
+            allowed_account_ids=frozenset({1, 2}),
+        )
+
+        stmt = mock_session.scalars.call_args.args[0]
+        sql = str(stmt.compile(dialect=sqlalchemy.dialects.postgresql.dialect()))
+        assert "emails.account_id IN" in sql
+        assert "ILIKE" in sql
+
+    async def test_get_email_by_id_in_accounts_returns_none_without_scope(self):
+        mock_session = self._mock_session()
+        repo = EmailRepository(mock_session)
+
+        result = await repo.get_email_by_id_in_accounts(9, allowed_account_ids=frozenset())
+
+        assert result is None
+        mock_session.scalar.assert_not_awaited()
 
     async def test_create_email_adds_and_flushes(self):
         mock_session = self._mock_session()
@@ -188,7 +215,9 @@ class TestEmailRepository:
     async def test_bulk_builds_pg_insert_statement(self):
         """验证 bulk_create_email 组装 PG 方言的 ON CONFLICT DO NOTHING 语句。"""
         mock_session = self._mock_session()
-        mock_session.execute = AsyncMock(return_value=MagicMock(fetchall=MagicMock(return_value=[1, 2])))
+        mock_session.execute = AsyncMock(
+            return_value=MagicMock(fetchall=MagicMock(return_value=[1, 2]))
+        )
 
         repo = EmailRepository(mock_session)
         msgs = [

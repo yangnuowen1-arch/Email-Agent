@@ -8,10 +8,12 @@ Email-Agent is being evolved into a human-supervised enterprise-mail assistant:
 2. classify mail, extract information, and prepare reply drafts through an LLM;
 3. require a human approval before any outbound action is sent through SMTP.
 
-The current implementation phase covers only the first capability: **inbound mail
-sync and archival**.  It deliberately does not add placeholder SMTP, LLM, or
-approval code.  Those capabilities have different side-effect and audit
-requirements and will be added as separate use cases.
+The current runnable entry point covers only the first capability: **inbound
+mail sync and archival**.  The codebase may add read-only tool and LLM-gateway
+contracts ahead of a user-facing agent entry point, but those contracts do not
+enable automatic mail analysis, approval, or SMTP delivery.  Those capabilities
+have different side-effect and audit requirements and will be added as separate
+use cases.
 
 ## Dependency direction
 
@@ -34,6 +36,47 @@ import SQLAlchemy models, repositories, an IMAP SDK, or environment variables.
 `providers` contains protocol-specific adapters.  `db` contains SQLAlchemy
 models and repositories plus the storage adapter.  `core` contains one settings
 entry point and the composition root; it does not contain business workflows.
+
+## Read-only mail-tool foundation
+
+Before introducing an agent loop, the system may expose already archived mail
+through a small set of model-visible, **read-only** tools:
+
+```text
+trusted caller scope
+        |
+        v
+typed Tool (JSON-schema validation, per-call authorization, timeout)
+        |
+        v
+mail-query service
+        |
+        v
+query port <---- SQLAlchemy query adapter ---- emails
+```
+
+The trusted caller supplies the account IDs it is allowed to access.  The tool
+must reject an explicitly requested account outside that scope, and the query
+adapter must apply the same scope in its database predicate.  A missing email
+is reported as a stable structured observation rather than revealing whether a
+different account owns it.
+
+The initial tools are intentionally narrow:
+
+- `search_mail`: search previously stored mail by text and/or sender, returning
+  metadata and a short text snippet;
+- `get_email_context`: return a bounded plain-text context for one mail ID.
+
+Tools call deterministic services, never ORM repositories or IMAP clients
+directly.  Their inputs and result models use Pydantic so a gateway can export
+JSON Schema to a provider while validating returned tool arguments locally.
+The initial LLM gateway contract may carry messages, tool definitions, and tool
+calls without selecting or configuring a concrete model provider.
+
+The default tool set is built in `app.tools.registry`, not in the composition
+root.  A future authenticated Agent/API request supplies the container's
+already-wired services to that factory, so new default tools have one
+discoverable registration point without making a tool registry process-global.
 
 ## Inbound sync contract
 
@@ -92,5 +135,7 @@ machine, and the SMTP adapter will be reachable only from an
 - service tests use fake `InboundMailbox` and `EmailSyncStore` implementations;
 - IMAP adapter tests mock only the IMAP client;
 - SQLAlchemy adapter tests verify ORM mapping and transaction semantics;
+- mail-tool tests use a fake query service to cover schema validation, account
+  scope, not-found/error observations, and registry timeouts;
 - future LLM tests use a scripted fake gateway, and future SMTP tests prove that
   an unapproved draft cannot trigger a send.

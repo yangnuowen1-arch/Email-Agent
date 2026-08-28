@@ -1,5 +1,23 @@
 """LLM client interfaces and local development implementations."""
 
-from .client import EchoLLMClient, LLMClient, LLMResponse
+from .client import (
+    EchoLLMClient,
+    LLMClient,
+    LLMGateway,
+    LLMMessage,
+    LLMMessageRole,
+    LLMRequest,
+    LLMResponse,
+    ToolCall,
+)
 
-__all__ = ["EchoLLMClient", "LLMClient", "LLMResponse"]
+__all__ = [
+    "EchoLLMClient",
+    "LLMClient",
+    "LLMGateway",
+    "LLMMessage",
+    "LLMMessageRole",
+    "LLMRequest",
+    "LLMResponse",
+    "ToolCall",
+]

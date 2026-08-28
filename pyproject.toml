@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "A minimal, extensible Python starter for building an email agent."
 requires-python = ">=3.11"
 dependencies = [
+    "pydantic>=2.13,<3",
     "pydantic-settings>=2.15.0",
     "sqlalchemy[asyncio]>=2.0",
     "psycopg[binary]>=3.1",
