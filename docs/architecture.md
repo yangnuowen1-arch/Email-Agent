@@ -70,13 +70,55 @@ The initial tools are intentionally narrow:
 Tools call deterministic services, never ORM repositories or IMAP clients
 directly.  Their inputs and result models use Pydantic so a gateway can export
 JSON Schema to a provider while validating returned tool arguments locally.
-The initial LLM gateway contract may carry messages, tool definitions, and tool
-calls without selecting or configuring a concrete model provider.
+The provider-neutral LLM gateway carries messages, tool definitions, and tool
+calls without selecting or configuring a concrete model provider.  An assistant
+message retains the tool-call IDs, names, and arguments returned by the model;
+each subsequent tool message references one of those IDs and contains a JSON
+encoded structured observation.  This produces a replayable transcript for
+the next model turn without allowing the model to choose its own account scope.
+
+``ScriptedLLMGateway`` is a deterministic test double rather than a production
+provider.  It records requests and returns a configured sequence of model
+responses, so tool loops are tested without network access or model cost.
 
 The default tool set is built in `app.tools.registry`, not in the composition
 root.  A future authenticated Agent/API request supplies the container's
 already-wired services to that factory, so new default tools have one
 discoverable registration point without making a tool registry process-global.
+
+## Minimal LangGraph tool loop
+
+The first agent runtime lives in `app.agent` and deliberately has a narrow,
+read-only responsibility:
+
+```text
+trusted run request
+        |
+        v
+model -- no tool call --> end
+  |
+  +-- tool calls --> registry dispatcher --> structured observations
+                                     |
+                                     +--------> model
+```
+
+The graph receives an injected `LLMGateway` and `ToolRegistry`; it never
+imports ORM repositories, providers, or concrete LLM SDKs.  Trusted account
+scope is input from the server-side caller and is reconstructed into a
+`ToolContext` only at the dispatch node.  The model cannot widen that scope.
+New runs accept only system and user messages; a future resume feature must
+load prior assistant/tool transcript from trusted server-side storage rather
+than accepting it from an untrusted request.
+
+Each run has a generated `run_id`, a bounded number of model turns, a bounded
+number of tool calls per model turn, a model-response timeout, an ordered tool
+event trail (tool name, call ID, success, duration, and error code), and a
+stable terminal reason.  The graph does not install a persistent checkpointer
+yet: its state can contain authorized email context and must not be silently
+persisted without an explicit retention, encryption, and access-control design.
+The existing `ToolRegistry` remains responsible for individual-tool timeouts;
+the graph treats timeout and all other tool failures as observations and gives
+the model a chance to recover or answer honestly.
 
 ## Inbound sync contract
 
@@ -137,5 +179,7 @@ machine, and the SMTP adapter will be reachable only from an
 - SQLAlchemy adapter tests verify ORM mapping and transaction semantics;
 - mail-tool tests use a fake query service to cover schema validation, account
   scope, not-found/error observations, and registry timeouts;
-- future LLM tests use a scripted fake gateway, and future SMTP tests prove that
-  an unapproved draft cannot trigger a send.
+- LLM and agent tests use a scripted fake gateway to cover no-tool paths,
+  model-to-tool-to-model transcript replay, structured failures, and the
+  maximum-turn, tool-call-limit, and model-timeout terminal states;
+- future SMTP tests prove that an unapproved draft cannot trigger a send.

@@ -8,6 +8,7 @@ from .client import (
     LLMMessageRole,
     LLMRequest,
     LLMResponse,
+    ScriptedLLMGateway,
     ToolCall,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "LLMMessageRole",
     "LLMRequest",
     "LLMResponse",
+    "ScriptedLLMGateway",
     "ToolCall",
 ]
