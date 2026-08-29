@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
+from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 
 from app.providers.email.base import MailClientError
 from app.providers.email.factory import create_client
@@ -12,58 +15,73 @@ from app.services.parsing import parse_email
 logger = logging.getLogger(__name__)
 
 
-def _blocking_fetch(account: AccountSpec, client_factory, since_uid: int, limit):
-    """在线程池内同步拉取原始邮件：连接→拉取→关闭。
-
-    客户端对象只在该线程内使用，避免跨线程复用 IMAP 连接。
-    """
-    client = client_factory(account)
-    try:
-        client.connect()
-        return client.fetch_emails(account.folder, since_uid, limit=limit)
-    finally:
-        with contextlib.suppress(Exception):
-            client.close()
-
-
 class EmailService:
-    """邮件读取服务：仅负责从邮件源拉取并解析邮件内容，不做任何 DB 操作。"""
+    """邮件接收服务：阻塞式接收新邮件并解析，不做任何 DB 操作。
+
+    长驻的 IMAP IDLE 调用占用执行器线程；解析与落库的编排由调用方通过
+    ``on_batch`` 异步回调完成，本类只负责线程↔事件循环的桥接与背压。
+    """
 
     def __init__(self, client_factory=create_client, parser=parse_email) -> None:
         self._client_factory = client_factory
         self._parser = parser
 
-    async def read(
-        self, account: AccountSpec, *, full: bool = False, limit=None
-    ) -> list[EmailData]:
-        """拉取并解析指定账号的邮件，返回解析后的邮件数据列表。
+    async def receive(
+        self,
+        account: AccountSpec,
+        on_batch: Callable[[list[EmailData]], Awaitable[None]],
+        stop_event: threading.Event,
+        executor: ThreadPoolExecutor | None = None,
+    ) -> None:
+        """阻塞式接收指定账号的新邮件，直到 stop_event 置位或认证失败。
 
-        阻塞的 IMAP 调用通过事件循环的默认线程池执行，避免阻塞主循环；解析失败
-        的单封邮件仅告警并跳过，不中断整批。
+        阻塞的 IMAP 调用通过执行器线程长驻运行，避免阻塞事件循环；新邮件批次
+        解析后交给 ``on_batch``（在事件循环中执行），并阻塞等待其完成——落库
+        失败会原样传回 provider，本批不确认，之后自动重推（落库需幂等）。
+        单封解析失败仅告警并跳过，不中断整批。
         """
-        if limit is not None and (not isinstance(limit, int) or limit <= 0):
-            msg = f"limit must be positive int or None, got {limit!r}"
-            raise ValueError(msg)
-
-        # 增量起点：full 模式从 0 开始（全量），否则从上次断点继续
-        since_uid = 0 if full else account.last_sync_uid
-
         loop = asyncio.get_running_loop()
+
+        def _blocking_receive() -> None:
+            # 客户端对象只在该线程内使用，避免跨线程复用 IMAP 连接
+            client = self._client_factory(account)
+            try:
+                client.connect()
+                client.receive_emails(
+                    account.folder,
+                    self._make_sync_callback(account, on_batch, loop),
+                    stop_event=stop_event,
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    client.close()
+
         try:
-            raw_list = await loop.run_in_executor(
-                None, _blocking_fetch, account, self._client_factory, since_uid, limit
-            )
+            await loop.run_in_executor(executor, _blocking_receive)
         except MailClientError:
-            # 连接/拉取失败向上抛出，交由上层（core）做账号级隔离
+            # 不可恢复错误（如认证失败）向上抛出，交由上层（core）记录隔离
             raise
 
-        messages: list[EmailData] = []
-        for uid, raw in raw_list:
-            try:
-                messages.append(
-                    self._parser(RawEmail(account_id=account.account_id, uid=uid, raw=raw))
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("parse failed for account %s uid %s: %s", account.name, uid, exc)
-                continue
-        return messages
+    def _make_sync_callback(
+        self,
+        account: AccountSpec,
+        on_batch: Callable[[list[EmailData]], Awaitable[None]],
+        loop: asyncio.AbstractEventLoop,
+    ) -> Callable[[list[tuple[int, bytes]]], None]:
+        """把异步批次回调包装为接收线程内的同步回调（带背压）。"""
+
+        def _on_raw_batch(raw_list: list[tuple[int, bytes]]) -> None:
+            messages: list[EmailData] = []
+            for uid, raw in raw_list:
+                try:
+                    messages.append(
+                        self._parser(RawEmail(account_id=account.account_id, uid=uid, raw=raw))
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("parse failed for account %s uid %s: %s", account.name, uid, exc)
+                    continue
+
+            # 阻塞等待事件循环完成落库：异常原样传回 provider（不确认本批）
+            asyncio.run_coroutine_threadsafe(on_batch(messages), loop).result()
+
+        return _on_raw_batch

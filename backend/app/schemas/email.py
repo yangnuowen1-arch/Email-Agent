@@ -28,33 +28,10 @@ class ParsedEmail:
 
 
 @dataclass(frozen=True, kw_only=True)
-class AccountResult:
-    """单账号同步结果，用于上层汇总与失败定位。"""
-
-    account_id: int
-    name: str
-    inserted: int = 0
-    skipped: int = 0
-    error: str | None = None
-    duration_ms: int = 0
-
-
-@dataclass(frozen=True, kw_only=True)
-class BatchResult:
-    """批量同步的汇总报告。"""
-
-    results: list[AccountResult] = field(default_factory=list)
-    total_inserted: int = 0
-    total_skipped: int = 0
-    total_failed: int = 0
-    duration_ms: int = 0
-
-
-@dataclass(frozen=True, kw_only=True)
 class AccountSpec:
     """供 services / providers 使用的账号只读视图（解耦 services 与 db）。
 
-    由 ``core.sync._to_account_spec`` 从 ORM ``Account`` 投影而来；字段与
+    由 ``core.listener._to_account_spec`` 从 ORM ``Account`` 投影而来；字段与
     ``schemas.account.AccountConfig`` 高度重合，使 provider 客户端无需认识持久化模型。
     """
 

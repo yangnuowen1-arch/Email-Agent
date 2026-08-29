@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import signal
 
 import typer
 
@@ -16,10 +18,7 @@ app = typer.Typer(
 
 @app.callback()
 def cli(ctx: typer.Context) -> None:
-    """构建容器并存入上下文；具体工作由子命令执行。
-
-    默认不强制要求数据库；需要数据库的 ``sync`` / ``email-agent`` 子命令会自行校验。
-    """
+    """构建容器并存入上下文；具体工作由子命令执行。 """
     try:
         config = AppConfig.from_env(require_database=False)
     except ValueError as exc:
@@ -48,14 +47,6 @@ def email_agent(
     """邮件智能体：读取未分析邮件并进入意向分析，结果落库 email_analyses。"""
     container: Container = ctx.obj
 
-    if not container.config.database_url:
-        container.logger.error("email_agent_requires_database")
-        typer.echo(
-            "DATABASE_URL is required for email-agent; set it in environment or .env",
-            err=True,
-        )
-        raise typer.Exit(code=2)
-
     try:
         results = asyncio.run(container.email_coordinator.start_analyze())
     except LLMConfigurationError as exc:
@@ -71,52 +62,43 @@ def email_agent(
     typer.echo(f"analyzed={analyzed} failed={failed}")
 
 @app.command()
-def sync(ctx: typer.Context) -> None:
-    """从各启用账号拉取邮件并落库（并发数/超时由配置决定，无命令行参数）。"""
+def listen(ctx: typer.Context) -> None:
+    """常驻监听各启用账号的新邮件（IMAP IDLE），收到即落库；Ctrl+C 优雅退出。"""
     container: Container = ctx.obj
     if not container.config.database_url:
-        container.logger.error("sync_requires_database")
+        container.logger.error("listen_requires_database")
         typer.echo(
-            "DATABASE_URL is required for sync; set it in environment or .env",
+            "DATABASE_URL is required for listen; set it in environment or .env",
             err=True,
         )
         raise typer.Exit(code=2)
-    asyncio.run(_run(container))
+    asyncio.run(_listen(container))
 
 
-async def _run(container: Container) -> None:
+async def _listen(container: Container) -> None:
     log = container.logger
-    log.info("sync_started")
+    loop = asyncio.get_running_loop()
 
-    report = await container.synchronizer.sync_accounts()
+    # SIGINT/SIGTERM → 请求监听停止；接收线程在当前 ping 周期内退出后统一释放容器
+    def _request_stop() -> None:
+        log.info("listen_stop_requested")
+        container.listener.request_stop()
 
-    log.info(
-        "sync_finished",
-        inserted=report.total_inserted,
-        skipped=report.total_skipped,
-        failed=report.total_failed,
-        duration_ms=report.duration_ms,
-    )
-    typer.echo(
-        f"inserted={report.total_inserted} skipped={report.total_skipped} "
-        f"failed={report.total_failed} duration_ms={report.duration_ms}"
-    )
-    for result in report.results:
-        if result.error:
-            log.error(
-                "account_sync_failed",
-                account_id=result.account_id,
-                account_name=result.name,
-                error=result.error,
-            )
-            typer.echo(
-                f"  account {result.account_id} ({result.name}) ERROR: {result.error}",
-                err=True,
-            )
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, _request_stop)
 
-    # close_all 是异步生命周期；CLI 是同步边界，由这里桥接事件循环
-    await container.close_all()
-    log.info("container_closed")
+    log.info("listen_started")
+    try:
+        await container.listener.run()
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError, RuntimeError):
+                loop.remove_signal_handler(sig)
+
+        # close_all 是异步生命周期；CLI 是同步边界，由这里桥接事件循环
+        await container.close_all()
+        log.info("container_closed")
 
 
 def main() -> None:

@@ -18,12 +18,12 @@ class LLMConfig(BaseSettings):
 
     # LLM 智能体运行配置（OpenAI 兼容网关）
     llm_provider: str = "openai"
-    llm_model: str = "hy3"
+    llm_model: str = "mimo-v2.5"
     llm_base_url: str = "https://opencode.ai/zen/go/v1"
     llm_api_key: str | None = None
     llm_temperature: float = 0.2
     llm_max_tokens: int = 4096
-    llm_timeout_seconds: int = 120
+    llm_timeout_seconds: int = 320
 
 
 def _parse_int(name: str, raw: str | None, default: int) -> int:
@@ -53,10 +53,11 @@ class AppConfig:
     # 连接池最小/最大连接数，I/O 密集场景下可适当调大
     db_pool_min_size: int = 1
     db_pool_max_size: int = 10
-    # 账号级并发数，对应 ThreadPoolExecutor 的 max_workers
-    sync_max_workers: int = 5
-    # 单账号同步超时时间（秒），超时后记为失败并隔离，不影响其他账号
-    sync_timeout_seconds: int = 60
+    # IMAP IDLE 重发/健康检查周期（秒）：每次醒来做一次轻量搜索兜底丢事件
+    listen_idle_ping_seconds: int = 60
+    # 断线重连退避起点与上限（秒），指数递增封顶
+    listen_backoff_initial_seconds: int = 1
+    listen_backoff_max_seconds: int = 60
     # 单个工具调用的超时时间（秒），由 tools/registry 在装配时套用到每个工具
     agent_tool_timeout_seconds: int = 30
     # 日志级别，控制 JSON 结构化日志的输出粒度
@@ -80,19 +81,28 @@ class AppConfig:
                 f"must be <= DB_POOL_MAX_SIZE ({self.db_pool_max_size})"
             )
             raise ValueError(msg)
-        # 并发数和超时时间也必须为正整数
-        if self.sync_max_workers < 1:
-            msg = f"SYNC_MAX_WORKERS must be >=1, got {self.sync_max_workers!r}"
+        # 监听调优参数必须为正整数，退避起点不能超过上限
+        if self.listen_idle_ping_seconds < 1:
+            msg = f"LISTEN_IDLE_PING_SECONDS must be >=1, got {self.listen_idle_ping_seconds!r}"
             raise ValueError(msg)
-        if self.sync_timeout_seconds < 1:
-            msg = f"SYNC_TIMEOUT_SECONDS must be >=1, got {self.sync_timeout_seconds!r}"
+        if self.listen_backoff_initial_seconds < 1:
+            msg = (
+                f"LISTEN_BACKOFF_INITIAL_SECONDS must be >=1, "
+                f"got {self.listen_backoff_initial_seconds!r}"
+            )
+            raise ValueError(msg)
+        if self.listen_backoff_max_seconds < self.listen_backoff_initial_seconds:
+            msg = (
+                f"LISTEN_BACKOFF_MAX_SECONDS ({self.listen_backoff_max_seconds}) must be >= "
+                f"LISTEN_BACKOFF_INITIAL_SECONDS ({self.listen_backoff_initial_seconds})"
+            )
             raise ValueError(msg)
 
     @classmethod
     def from_env(cls, require_database: bool = True) -> AppConfig:
         """从环境变量和 .env 文件加载配置。
 
-        ``require_database`` 为 True 时强制要求 ``DATABASE_URL``（sync 等需要落库
+        ``require_database`` 为 True 时强制要求 ``DATABASE_URL``（listen 等需要落库
         的流程）；agent 等无需数据库的流程可传 False，从而不依赖数据库即可启动。
         """
         # 加载 .env 文件，override=False 表示已有的环境变量优先，保持容器/CI 注入的优先级
@@ -109,9 +119,14 @@ class AppConfig:
         # 读取可选的整型配置，均通过 _parse_int 解析，非法值会抛出带变量名的错误
         db_pool_min_size = _parse_int("DB_POOL_MIN_SIZE", os.getenv("DB_POOL_MIN_SIZE"), 1)
         db_pool_max_size = _parse_int("DB_POOL_MAX_SIZE", os.getenv("DB_POOL_MAX_SIZE"), 10)
-        sync_max_workers = _parse_int("SYNC_MAX_WORKERS", os.getenv("SYNC_MAX_WORKERS"), 5)
-        sync_timeout_seconds = _parse_int(
-            "SYNC_TIMEOUT_SECONDS", os.getenv("SYNC_TIMEOUT_SECONDS"), 60
+        listen_idle_ping_seconds = _parse_int(
+            "LISTEN_IDLE_PING_SECONDS", os.getenv("LISTEN_IDLE_PING_SECONDS"), 60
+        )
+        listen_backoff_initial_seconds = _parse_int(
+            "LISTEN_BACKOFF_INITIAL_SECONDS", os.getenv("LISTEN_BACKOFF_INITIAL_SECONDS"), 1
+        )
+        listen_backoff_max_seconds = _parse_int(
+            "LISTEN_BACKOFF_MAX_SECONDS", os.getenv("LISTEN_BACKOFF_MAX_SECONDS"), 60
         )
 
         # 日志级别统一转大写，空值回退到 INFO，避免大小写敏感导致配置不生效
@@ -121,7 +136,8 @@ class AppConfig:
             database_url=database_url,
             db_pool_min_size=db_pool_min_size,
             db_pool_max_size=db_pool_max_size,
-            sync_max_workers=sync_max_workers,
-            sync_timeout_seconds=sync_timeout_seconds,
+            listen_idle_ping_seconds=listen_idle_ping_seconds,
+            listen_backoff_initial_seconds=listen_backoff_initial_seconds,
+            listen_backoff_max_seconds=listen_backoff_max_seconds,
             log_level=log_level,
         )

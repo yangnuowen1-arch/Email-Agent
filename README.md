@@ -1,9 +1,9 @@
 # Email-Agent
 
-从 PostgreSQL 读取邮箱账号配置，通过 IMAP 增量拉取邮件，解析后写回 PostgreSQL。
+从 PostgreSQL 读取邮箱账号配置，通过 IMAP IDLE 长驻监听各账号的新邮件，解析后写回 PostgreSQL。
 
 ```
-email_accounts → IMAP → 解析邮件 → emails → 更新 last_sync_uid
+email_accounts → IMAP IDLE 常驻监听 → 新邮件回调 → 解析邮件 → emails → 更新 last_sync_uid
 ```
 
 ## 环境要求
@@ -46,8 +46,9 @@ cp .env.example .env
 
 ```dotenv
 DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/email_agent
-SYNC_MAX_WORKERS=5
-SYNC_TIMEOUT_SECONDS=60
+LISTEN_IDLE_PING_SECONDS=60
+LISTEN_BACKOFF_INITIAL_SECONDS=1
+LISTEN_BACKOFF_MAX_SECONDS=60
 LOG_LEVEL=INFO
 
 # LLM 智能体（运行 agent 命令必填 LLM_API_KEY；其余可选）
@@ -96,18 +97,18 @@ ORDER BY id;
 | 目的 | 命令 |
 |---|---|
 | 查看帮助 | `uv run python -m app --help` |
-| 增量同步（需 DATABASE_URL） | `uv run python -m app sync` |
+| 常驻监听新邮件（需 DATABASE_URL） | `uv run python -m app listen` |
 | 运行 agent 任务（仅需 LLM_API_KEY，不依赖数据库） | `uv run python -m app agent "你的任务"` |
-| 摘要最近邮件（需先 sync 落库） | `uv run python -m app agent "summarize my recent emails"` |
+| 摘要最近邮件（需先 listen 落库） | `uv run python -m app agent "summarize my recent emails"` |
 | 已安装脚本入口 | `uv run email-agent --help` |
 
-`email-agent` 是命令名；`app` 是 Python 模块名。它们指向同一个 CLI 程序。注意：`python -m app` 不带子命令时只初始化容器后退出，**不会**再自动同步；同步必须显式使用 `sync` 子命令。
+`email-agent` 是命令名；`app` 是 Python 模块名。它们指向同一个 CLI 程序。注意：`python -m app` 不带子命令时只初始化容器后退出，**不会**自动监听；必须显式使用 `listen` 子命令。
 
 ### Agent 命令
 
 `agent <task>` 是统一的自然语言入口：把任务交给 `EmailAgent`，由它按需调用已注册工具（如 `summarize_emails`）完成工作，并打印结果。
 
-- 邮件类任务（如摘要）需要先 `sync` 把邮件落库；agent 通过工具读取最近邮件再归纳。
+- 邮件类任务（如摘要）需要先跑 `listen` 把邮件落库；agent 通过工具读取最近邮件再归纳。
 - `limit`、`account_id` 等由 LLM 从任务文本中解析后传给工具，无需额外命令行参数。
 - 无 `DATABASE_URL` 时仍可运行不依赖邮件的任务；若任务需要邮件但无数据库，工具会返回错误并由 LLM 如实说明。
 
@@ -119,40 +120,27 @@ uv run python -m app agent "summarize my 5 most recent emails for account 3"
 uv run python -m app agent "写一封请假邮件，语气正式"
 ```
 
-### 同步参数说明
+### 监听机制与参数说明
 
-`sync` 子命令当前不接受命令行参数。增量范围由账号的 `last_sync_uid` 断点控制，并发数与超时由以下环境变量决定：
+`listen` 子命令不接受命令行参数。它为每个启用账号维持一个长驻线程（IMAP IDLE）：新邮件到达时即时解析入库并推进账号的 `last_sync_uid` 断点；断线自动指数退避重连，从断点继续、不丢不重。
 
 | 变量 | 说明 |
 |---|---|
-| `SYNC_MAX_WORKERS` | 账号级并发数（对应线程池 max_workers）。 |
-| `SYNC_TIMEOUT_SECONDS` | 单账号同步超时，超时记为失败并隔离，不影响其他账号。 |
+| `LISTEN_IDLE_PING_SECONDS` | IDLE 重发/健康检查周期（默认 60 秒），每次醒来做一次轻量搜索兜底丢事件；Ctrl+C 优雅退出的最长等待也受此值影响。 |
+| `LISTEN_BACKOFF_INITIAL_SECONDS` | 断线重连退避起点（默认 1 秒），指数递增。 |
+| `LISTEN_BACKOFF_MAX_SECONDS` | 断线重连退避上限（默认 60 秒）。 |
 
-重构前支持的 `--limit` / `--full` 调试参数已移除；如需限量调试，可临时调整账号的 `last_sync_uid`。
+监听只接收**启动之后新到的邮件**，不回补历史存量；登录失败等不可恢复错误会终止该账号的监听并记录日志，其他账号不受影响。
 
-程序输出类似：
+## 验证新邮件监听
 
-```text
-inserted=1 skipped=0 failed=0 duration_ms=1234
-```
-
-不要只看进程退出码：某个账号同步失败时，程序会继续处理其他账号。请检查汇总中的 `failed` 数量。
-
-## 验证今天的邮件同步
-
-当前程序按 UID 增量拉取，不提供“只拉今天”的 IMAP 筛选。验证时建议给测试邮箱发一封唯一主题的邮件，例如：
+给测试邮箱发一封唯一主题的邮件，例如：
 
 ```text
-[Email-Agent Test] 2026-08-26-001
+[Email-Agent Test] 2026-08-29-001
 ```
 
-然后运行正常增量同步：
-
-```bash
-uv run python -m app sync
-```
-
-在 PostgreSQL 中确认这封邮件已写入。以下查询按上海自然日查看“今天被程序拉取”的邮件：
+保持 `listen` 运行，邮件应即时入库（无需重跑命令）。在 PostgreSQL 中确认：
 
 ```sql
 SET TIME ZONE 'Asia/Shanghai';
@@ -160,15 +148,19 @@ SET TIME ZONE 'Asia/Shanghai';
 SELECT a.name, e.uid, e.subject, e.sender, e.sent_at, e.fetched_at
 FROM emails AS e
 JOIN email_accounts AS a ON a.id = e.account_id
-WHERE e.subject = '[Email-Agent Test] 2026-08-26-001'
-  AND e.fetched_at >= CURRENT_DATE
-  AND e.fetched_at < CURRENT_DATE + 1
+WHERE e.subject = '[Email-Agent Test] 2026-08-29-001'
 ORDER BY e.fetched_at DESC;
 ```
 
-再次运行同一条同步命令且没有新邮件时，应看到 `fetched=0`、`inserted=0`，这说明断点生效。
+再查账号断点应已推进到该邮件的 uid：
 
-注意：首次同步时 `last_sync_uid=0` 会拉取整个文件夹。建议用专门的测试邮箱，或先完成一次基线同步再按需增量。
+```sql
+SELECT id, name, last_sync_uid, last_sync_at
+FROM email_accounts
+ORDER BY id;
+```
+
+注意：`listen` 只推送监听启动之后新到的邮件；监听期间到达的邮件由断点与唯一约束（`account_id, uid`）保证不丢不重。建议用专门的测试邮箱。
 
 `fetched_at` 表示本程序何时拉取并入库；`sent_at` 来自邮件的 `Date` 头，可能受发件人时区或错误时间影响。
 
@@ -195,8 +187,8 @@ uv run ruff format backend/app tests
 Email-Agent/
 ├── backend/
 │   └── app/                 # Python 包：import app
-│       ├── cli/             # 命令行入口（agent / sync 子命令）
-│       ├── core/            # 配置与组合根（Container）
+│       ├── cli/             # 命令行入口（agent / listen 子命令）
+│       ├── core/            # 配置、监听编排（EmailListener）与组合根（Container）
 │       ├── db/              # SQLAlchemy 引擎、Session 与 ORM 模型、仓储
 │       ├── providers/       # IMAP 等外部适配器
 │       ├── services/        # 解析和同步编排

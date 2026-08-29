@@ -1,11 +1,24 @@
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from types import TracebackType
 
 from app.schemas.account import AccountConfig
 
-__all__ = ["AccountConfig", "MailClient", "MailClientError"]
+__all__ = [
+    "AccountConfig",
+    "MailClient",
+    "MailClientAuthError",
+    "MailClientError",
+]
+
+#: 一批待回调的原始邮件： ``(uid, raw RFC822 字节)`` 列表，按 uid 升序
+RawBatch = list[tuple[int, bytes]]
+
+#: 新邮件批次回调：实现方保证仅在批次可被安全重试时抛异常
+BatchCallback = Callable[[RawBatch], None]
 
 
 class MailClientError(Exception):
@@ -16,11 +29,19 @@ class MailClientError(Exception):
     """
 
 
+class MailClientAuthError(MailClientError):
+    """认证/登录失败等不可恢复错误。
+
+    自动重连对此类错误无意义，实现方应直接向上抛出终止接收，
+    由调用方决定是否修正配置后重启监听。
+    """
+
+
 class MailClient(ABC):
     """邮件客户端抽象基类，定义所有协议必须实现的接口。
 
-    子类需实现 ``connect`` / ``fetch_emails`` / ``close``，
-    分别对应 IMAP 等具体协议的连接、拉取、关闭逻辑。
+    子类需实现 ``connect`` / ``receive_emails`` / ``close``，
+    分别对应 IMAP 等具体协议的连接、阻塞式接收、关闭逻辑。
 
     基类已提供 ``__enter__`` / ``__exit__``，调用方可直接使用
     ``with create_client(account) as client:`` 的上下文管理写法。
@@ -35,21 +56,28 @@ class MailClient(ABC):
         """建立连接并完成认证。"""
 
     @abstractmethod
-    def fetch_emails(
+    def receive_emails(
         self,
         folder: str,
-        since_uid: int,
-        limit: int | None = None,
-    ) -> list[tuple[int, bytes]]:
-        """拉取指定文件夹中 UID 大于 since_uid 的原始邮件。
+        on_batch: BatchCallback,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        """阻塞式接收新邮件，新邮件经 ``on_batch`` 回调推送。
+
+        约定：
+
+        - 启动时以文件夹当前状态为基线，只推送监听开始之后新到的邮件
+        - 新邮件按 uid 升序分批回调 ``(uid, raw_bytes)``；回调成功返回后批次
+          才算确认，回调抛异常则该批不确认，之后自动重推（调用方落库需幂等）
+        - 连接级故障由实现方内部自动重连（指数退避），重连后从已确认的最大
+          uid 继续，不丢不重
+        - 登录失败等不可恢复错误抛 :class:`MailClientAuthError`
+        - ``stop_event`` 置位后尽快返回
 
         Args:
             folder: 邮箱文件夹，如 ``INBOX``。
-            since_uid: 上次同步的最大 UID；``0`` 表示全量拉取。
-            limit: 可选的返回数量上限，按 UID 升序截断，用于调试/首跑限量。
-
-        Returns:
-            ``(uid, raw_bytes)`` 列表，按 uid 升序排列，raw_bytes 为完整 RFC822 字节。
+            on_batch: 批次回调，在实现方的接收线程内同步调用。
+            stop_event: 置位后要求尽快停止接收并返回。
         """
 
     @abstractmethod

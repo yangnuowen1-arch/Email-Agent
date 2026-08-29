@@ -32,6 +32,6 @@ def test_cli_help_exits_zero() -> None:
 
     assert result.returncode == 0
 
-    # 新设计：统一 agent 入口 + sync 数据摄入，均以子命令暴露
+    # 新设计：统一 agent 入口 + listen 常驻监听，均以子命令暴露
     assert "agent" in result.stdout
-    assert "sync" in result.stdout
+    assert "listen" in result.stdout

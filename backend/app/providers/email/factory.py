@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from app.providers.email.base import AccountConfig, MailClient
 from app.providers.email.imap.client import ImapMailClient
 
@@ -30,11 +32,13 @@ def register_client(protocol: str, cls: type[MailClient]) -> None:
     _REGISTRY[protocol.strip().lower()] = cls
 
 
-def create_client(account: AccountConfig) -> MailClient:
+def create_client(account: AccountConfig, **client_kwargs: Any) -> MailClient:
     """根据账号的 protocol 字段创建对应的 MailClient 实例。
 
     Args:
         account: 含 ``protocol`` 字段的账号对象，大小写不敏感。
+        **client_kwargs: 透传给具体协议客户端构造函数的调优参数
+            （如 IMAP 的 ``idle_ping_interval``）；组合根据此注入配置。
 
     Returns:
         绑定到 ``account`` 的具体 ``MailClient`` 实例。
@@ -49,4 +53,4 @@ def create_client(account: AccountConfig) -> MailClient:
     if cls is None:
         raise ValueError(f"unsupported protocol {account.protocol!r}")
 
-    return cls(account)
+    return cls(account, **client_kwargs)

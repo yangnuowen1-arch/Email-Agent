@@ -2,9 +2,7 @@
 # 任何一层都可以 import 本包；本包不 import 任何 app 内部模块。
 from app.schemas.account import AccountConfig
 from app.schemas.email import (
-    AccountResult,
     AccountSpec,
-    BatchResult,
     EmailData,
     ParsedEmail,
     RawEmail,
@@ -13,8 +11,6 @@ from app.schemas.email import (
 __all__ = [
     "AccountConfig",
     "ParsedEmail",
-    "AccountResult",
-    "BatchResult",
     "AccountSpec",
     "EmailData",
     "RawEmail",
