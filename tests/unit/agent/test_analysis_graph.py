@@ -1,14 +1,16 @@
-"""单邮件意向分析图单元测试：analyze 节点 + 编译后图端到端。"""
+"""单邮件意向分析图单元测试：analyze 节点 + 编译后图端到端 + 调用链追踪。"""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.messages import BaseMessage
 
 from app.agent.analysis_graph import (
     EmailAnalysisState,
+    GraphTraceHandler,
     _analyze_node,
     build_email_analysis_graph,
 )
@@ -20,10 +22,12 @@ from app.schemas.analysis import EmailAnalysisOutput, IntentDetail
 
 
 class _FakeStructuredRunnable:
-    def __init__(self, result: Any) -> None:
+    def __init__(self, result: Any, model: FakeChatModel) -> None:
         self._result = result
+        self._model = model
 
     async def ainvoke(self, messages: list[BaseMessage], **kwargs: Any) -> Any:
+        self._model.received_config = kwargs.get("config")
         if isinstance(self._result, Exception):
             raise self._result
         if isinstance(self._result, EmailAnalysisOutput):
@@ -36,11 +40,12 @@ class FakeChatModel:
         self._output = output
         self._error = error
         self.model_name = "fake-model"
+        self.received_config: Any = None
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> _FakeStructuredRunnable:
         if self._error:
-            return _FakeStructuredRunnable(self._error)
-        return _FakeStructuredRunnable(self._output)
+            return _FakeStructuredRunnable(self._error, self)
+        return _FakeStructuredRunnable(self._output, self)
 
 
 # ---------------------------------------------------------------------------
@@ -159,3 +164,77 @@ async def test_compiled_graph_llm_error_path() -> None:
 
     assert result.get("error") is not None
     assert "RuntimeError" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# 调用链追踪测试（GraphTraceHandler）
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    """模拟 LLM 响应，仅带 usage_metadata 属性。"""
+
+    usage_metadata = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+
+def test_trace_handler_llm_events_with_usage() -> None:
+    handler = GraphTraceHandler()
+    run_id = uuid4()
+    handler.on_chat_model_start(None, [], run_id=run_id, name="fake-model")
+    handler.on_llm_end(_FakeResponse(), run_id=run_id)
+
+    events = handler.dump()
+    assert [e["type"] for e in events] == ["llm_start", "llm_end"]
+    assert events[0]["name"] == "fake-model"
+    assert events[1]["usage"]["total_tokens"] == 15
+    assert events[1]["elapsed_ms"] >= 0
+
+
+def test_trace_handler_chain_error_event() -> None:
+    handler = GraphTraceHandler()
+    run_id = uuid4()
+    handler.on_chain_start(None, {}, run_id=run_id, name="analyze")
+    handler.on_chain_error(RuntimeError("boom"), run_id=run_id)
+
+    events = handler.dump()
+    assert events[-1]["type"] == "chain_error"
+    assert "RuntimeError" in events[-1]["error"]
+    assert events[-1]["elapsed_ms"] >= 0
+
+
+def test_trace_handler_dump_returns_copy() -> None:
+    handler = GraphTraceHandler()
+    handler.on_chain_start(None, {}, run_id=uuid4(), name="analyze")
+    events = handler.dump()
+    events.clear()
+    assert handler.dump()  # dump 是副本，外部修改不影响内部状态
+
+
+async def test_compiled_graph_captures_trace_events() -> None:
+    """带 callbacks 跑编译后的图，捕获 graph/analyze 节点链路且父子关联完整。"""
+    handler = GraphTraceHandler()
+    model = FakeChatModel(output=_success_output())
+    graph = build_email_analysis_graph(model)
+
+    result = await graph.ainvoke(_base_state(), config={"callbacks": [handler]})
+
+    assert "error" not in result
+    events = handler.dump()
+    starts = [e for e in events if e["type"] == "chain_start"]
+    assert any(e["name"] == "analyze" for e in starts)
+    # 父子关联：至少一个事件挂在上文出现过的 run_id 之下
+    run_ids = {e["run_id"] for e in events}
+    assert any(e.get("parent_run_id") in run_ids for e in events)
+    assert all(e["type"] != "chain_error" for e in events)
+
+
+async def test_compiled_graph_propagates_config_to_llm() -> None:
+    """config 注入节点并穿透到内层 runnable，否则 LLM 事件无法进入调用树。"""
+    model = FakeChatModel(output=_success_output())
+    graph = build_email_analysis_graph(model)
+    handler = GraphTraceHandler()
+
+    await graph.ainvoke(_base_state(), config={"callbacks": [handler]})
+
+    assert model.received_config is not None
+    assert "callbacks" in model.received_config

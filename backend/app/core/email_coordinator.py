@@ -6,9 +6,9 @@
 
 from __future__ import annotations
 
-from app.agent.analysis_graph import build_email_analysis_graph
+from app.agent.analysis_graph import GraphTraceHandler, build_email_analysis_graph
 from app.core.settings import AppConfig
-from app.db.db import EmailAnalysis
+from app.db.db import EmailAnalysis, EmailMessage
 from app.db.engine import Database
 from app.db.repositories import EmailAnalysisRepository, EmailRepository
 from app.llm import build_chat_model
@@ -45,7 +45,7 @@ class EmailCoordinator:
             email.html_body,
         )
 
-        # 3. 构建初始状态并驱动分析图
+        # 3. 构建初始状态并驱动分析图，结束后一次性记录完整调用链
         initial = {
             "email_id": email.id,
             "account_id": email.account_id,
@@ -55,7 +55,9 @@ class EmailCoordinator:
             "cleaned_text": cleaned_text,
         }
 
-        result = await self._analysis_graph.ainvoke(initial)
+        trace = GraphTraceHandler()
+        result = await self._analysis_graph.ainvoke(initial, config={"callbacks": [trace]})
+        self._logger.info("graph_trace", email_id=email.id, events=trace.dump())
 
         # 4. 落库分析结果（成功或失败兜底）
         async with self._database.session() as session:
@@ -91,12 +93,7 @@ class EmailCoordinator:
             "error": result.get("error"),
         }
 
-    async def start_analyze(
-        self, *, account_id: int | None = None, limit: int = 20
-    ) -> list[dict]:
-        """批量分析未处理邮件：逐封进入意向分析图，独立事务。"""
-        if self._database is None or self._analysis_graph is None:
-            return []
+    async def start_analyze(self, *, account_id: int | None = None, limit: int = 20) -> list[dict]:
 
         async with self._database.session() as session:
             unanalyzed = await EmailRepository(session).list_unanalyzed_email(

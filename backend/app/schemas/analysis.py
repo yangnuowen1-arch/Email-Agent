@@ -16,25 +16,40 @@ from pydantic import BaseModel, Field
 # 意图分类常量（单一来源，与 docs/db-schema.md 意图分类表 1:1）
 # ---------------------------------------------------------------------------
 
+#: 意图 key 常量（供路由/分发等下游按常量引用，禁止散落裸字符串）
+INTENT_CANCEL_ORDER = "cancel_order"
+INTENT_REFUND_REQUEST = "refund_request"
+INTENT_ORDER_STATUS_QUERY = "order_status_query"
+INTENT_INVOICE_QUERY = "invoice_query"
+INTENT_MEETING_REQUEST = "meeting_request"
+INTENT_COMPLAINT = "complaint"
+INTENT_SPAM_OR_NOTICE = "spam_or_notice"
+INTENT_OTHER = "other"
+INTENT_CONTRACT = "contract"
+INTENT_PAYMENT = "payment"
+INTENT_PARTNERSHIP = "partnership"
+INTENT_TECHNICAL_ISSUE = "technical_issue"
+INTENT_ACCOUNT_MANAGEMENT = "account_management"
+
 #: ToC（消费者场景）意图：英文标识 → 中文含义
 CONSUMER_INTENTS: dict[str, str] = {
-    "cancel_order": "取消订单/退订服务",
-    "refund_request": "退款申请",
-    "order_status_query": "订单状态查询/物流追踪",
-    "invoice_query": "发票/账单查询",
-    "meeting_request": "会议/日程请求",
-    "complaint": "投诉/不满表达",
-    "spam_or_notice": "垃圾邮件/系统通知/广告",
-    "other": "无法归类的消费者意图",
+    INTENT_CANCEL_ORDER: "取消订单/退订服务",
+    INTENT_REFUND_REQUEST: "退款申请",
+    INTENT_ORDER_STATUS_QUERY: "订单状态查询/物流追踪",
+    INTENT_INVOICE_QUERY: "发票/账单查询",
+    INTENT_MEETING_REQUEST: "会议/日程请求",
+    INTENT_COMPLAINT: "投诉/不满表达",
+    INTENT_SPAM_OR_NOTICE: "垃圾邮件/系统通知/广告",
+    INTENT_OTHER: "无法归类的消费者意图",
 }
 
 #: ToB（企业场景）意图：英文标识 → 中文含义
 BUSINESS_INTENTS: dict[str, str] = {
-    "contract": "合同/协议相关",
-    "payment": "付款/结算相关",
-    "partnership": "合作/商务洽谈",
-    "technical_issue": "技术问题/故障报告",
-    "account_management": "账号/权限管理",
+    INTENT_CONTRACT: "合同/协议相关",
+    INTENT_PAYMENT: "付款/结算相关",
+    INTENT_PARTNERSHIP: "合作/商务洽谈",
+    INTENT_TECHNICAL_ISSUE: "技术问题/故障报告",
+    INTENT_ACCOUNT_MANAGEMENT: "账号/权限管理",
 }
 
 #: 全部意图（含兜底），英文标识 → 中文含义

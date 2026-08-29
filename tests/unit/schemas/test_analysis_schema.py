@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from app.schemas import analysis
 from app.schemas.analysis import (
     ALL_INTENTS,
     INTENT_LITERAL,
@@ -31,6 +32,16 @@ def test_unknown_intent_is_in_all_intents() -> None:
 
 def test_unknown_intent_is_in_literal() -> None:
     assert UNKNOWN_INTENT in INTENT_LITERAL.__args__
+
+
+def test_intent_key_constants_cover_all_intents() -> None:
+    """INTENT_* 常量与 ALL_INTENTS 键集合一一对应，防止新增意图时漏建常量。"""
+    constant_values = {
+        value
+        for name, value in vars(analysis).items()
+        if name.startswith("INTENT_") and isinstance(value, str)
+    }
+    assert constant_values == set(ALL_INTENTS) - {UNKNOWN_INTENT}
 
 
 def test_every_intent_has_chinese_meaning() -> None:
