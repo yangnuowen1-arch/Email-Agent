@@ -47,3 +47,14 @@ EMAIL_ANALYSIS_SYSTEM_PROMPT = (
     "3. suggested_tools 从可用工具列表中选择（请参阅函数定义）。\n"
     f"4. primary_intent 必须输出，无法判定时使用 '{UNKNOWN_INTENT}'。"
 )
+
+EMAIL_TRANSLATE_SYSTEM_PROMPT = (
+    "你是一个邮件翻译器。先判断邮件使用的语言，再按规则处理：\n"
+    "1. 已是中文 → 主题与正文原样返回，不做改写。\n"
+    "2. 其他语言 → 将主题与正文完整译为简体中文，保留原文语气（愤怒/紧急）与换行格式。\n"
+    "3. 保持原文不译：订单号/工单号、金额数字、URL、邮箱地址、电话、代码、产品型号。\n\n"
+    '输出 JSON 字段：detected_language (ISO 639-1 代码，如 "en"/"ja"/"zh"), '
+    "translated_subject (字符串), translated_text (字符串)。\n\n"
+    '输出示例：{"detected_language": "en", "translated_subject": "关于订单 ORD-123 的退款请求", '
+    '"translated_text": "您好，我上周购买的…"}'
+)

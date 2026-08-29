@@ -152,6 +152,9 @@ CREATE TABLE email_analyses (
     status            TEXT NOT NULL DEFAULT 'analyzed',
     error             TEXT,
     model             TEXT,
+    source_language   TEXT,
+    translated_subject TEXT,
+    translated_text   TEXT,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -170,6 +173,9 @@ COMMENT ON COLUMN email_analyses.suggested_tools IS '建议后续调用的 Tool 
 COMMENT ON COLUMN email_analyses.status IS '分析状态：analyzed（成功）/ failed（LLM 异常或解析失败）';
 COMMENT ON COLUMN email_analyses.error IS '失败原因，仅 status=failed 时非空';
 COMMENT ON COLUMN email_analyses.model IS '产出该分析的模型名（如 gpt-4o-mini），便于回溯';
+COMMENT ON COLUMN email_analyses.source_language IS '检测到的源语言 ISO 639-1 代码（detect_and_translate 节点产出，如 en/ja/zh/unknown），中文启发式短路或垃圾邮件跳过翻译时为空';
+COMMENT ON COLUMN email_analyses.translated_subject IS '主题中文译文，仅非中文业务邮件非空（detect_and_translate 节点产出）';
+COMMENT ON COLUMN email_analyses.translated_text IS '正文中文译文，仅非中文业务邮件非空（detect_and_translate 节点产出）';
 COMMENT ON COLUMN email_analyses.created_at IS '首次分析时间';
 COMMENT ON COLUMN email_analyses.updated_at IS '最后更新时间，ON CONFLICT DO UPDATE 时刷新';
 
@@ -193,6 +199,9 @@ COMMENT ON COLUMN email_analyses.updated_at IS '最后更新时间，ON CONFLICT
 | status | TEXT | NOT NULL, DEFAULT 'analyzed' | analyzed（成功）/ failed（异常） |
 | error | TEXT | 可空 | 失败原因，仅 status=failed 时非空 |
 | model | TEXT | 可空 | 产出分析的模型名，便于回溯 |
+| source_language | TEXT | 可空 | 检测到的源语言 ISO 639-1 代码（en/ja/zh/unknown），未翻译为空 |
+| translated_subject | TEXT | 可空 | 主题中文译文，仅非中文业务邮件非空 |
+| translated_text | TEXT | 可空 | 正文中文译文，仅非中文业务邮件非空 |
 | created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 首次分析时间 |
 | updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 最后更新时间，ON CONFLICT DO UPDATE 时刷新 |
 
@@ -303,3 +312,20 @@ CREATE TABLE email_analyses (
 - `primary_intent`/`intents[].category` 改为白名单强校验：LLM 输出白名单外意图时校验失败 → 分析走 fallback（status=failed）。
 - `email_analyses` 的 `primary_intent`/`intents` 列注释补充中文含义，新增「意图分类表」见 §2.4。
 - **无任何表结构、约束或列定义变更，DDL 无需执行。**
+
+### 2026-08-29 email_analyses 新增翻译三列（支持检测翻译节点）
+
+分析图新增 `detect_and_translate` 节点（analyze 后按意图条件路由，垃圾/通知类不进该节点），
+检测非中文业务邮件的源语言并将主题/正文译为简体中文。`email_analyses` 追加三个可空列：
+
+```sql
+ALTER TABLE email_analyses
+    ADD COLUMN source_language TEXT,
+    ADD COLUMN translated_subject TEXT,
+    ADD COLUMN translated_text TEXT;
+COMMENT ON COLUMN email_analyses.source_language IS '检测到的源语言 ISO 639-1 代码（detect_and_translate 节点产出，如 en/ja/zh/unknown），中文启发式短路或垃圾邮件跳过翻译时为空';
+COMMENT ON COLUMN email_analyses.translated_subject IS '主题中文译文，仅非中文业务邮件非空（detect_and_translate 节点产出）';
+COMMENT ON COLUMN email_analyses.translated_text IS '正文中文译文，仅非中文业务邮件非空（detect_and_translate 节点产出）';
+```
+
+中文邮件（启发式短路）、垃圾/通知邮件、分析失败路径三列均为 NULL；DDL 与字段注释见 §2.3。

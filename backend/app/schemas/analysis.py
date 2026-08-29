@@ -85,6 +85,9 @@ SENTIMENT_LITERAL = Literal["positive", "neutral", "negative", "angry", "urgent"
 PRIORITIES: tuple[str, ...] = ("P0", "P1", "P2", "P3")
 PRIORITY_LITERAL = Literal["P0", "P1", "P2", "P3"]
 
+#: 排除在翻译之外的意图：垃圾/系统通知/广告无阅读价值，翻译纯属浪费调用
+TRANSLATION_EXCLUDED_INTENTS: frozenset[str] = frozenset({INTENT_SPAM_OR_NOTICE})
+
 
 class IntentDetail(BaseModel):
     """单条意图详情。"""
@@ -108,3 +111,13 @@ class EmailAnalysisOutput(BaseModel):
     sentiment: SENTIMENT_LITERAL = Field(default="neutral", description="发件人情绪")
     priority: PRIORITY_LITERAL = Field(default="P2", description="处理优先级")
     suggested_tools: list[str] = Field(default_factory=list, description="建议调用的 Tool 名列表")
+
+
+class EmailTranslationOutput(BaseModel):
+    """LLM 邮件翻译输出 schema：检测源语言与中文译文一次调用完成。"""
+
+    detected_language: str = Field(
+        description="检测到的源语言 ISO 639-1 代码，如 en/ja/ko/fr/de/zh"
+    )
+    translated_subject: str = Field(description="主题的简体中文译文；原文为中文时原样返回")
+    translated_text: str = Field(description="正文的简体中文译文；原文为中文时原样返回")

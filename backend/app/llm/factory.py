@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import httpx
 import structlog
-from langchain_openai import ChatOpenAI
 from langchain_core.rate_limiters import InMemoryRateLimiter
+from langchain_openai import ChatOpenAI
 
 from app.core.settings import LLMConfig
 from app.llm.errors import LLMConfigurationError

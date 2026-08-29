@@ -329,6 +329,9 @@ class EmailAnalysisRepository:
                 status=entity.status,
                 error=entity.error,
                 model=entity.model,
+                source_language=entity.source_language,
+                translated_subject=entity.translated_subject,
+                translated_text=entity.translated_text,
             )
             .on_conflict_do_update(
                 index_elements=["email_id"],
@@ -344,6 +347,9 @@ class EmailAnalysisRepository:
                     "status": entity.status,
                     "error": entity.error,
                     "model": entity.model,
+                    "source_language": entity.source_language,
+                    "translated_subject": entity.translated_subject,
+                    "translated_text": entity.translated_text,
                     "updated_at": now,
                 },
             )

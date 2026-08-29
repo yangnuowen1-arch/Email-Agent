@@ -317,6 +317,12 @@ class EmailAnalysis(Base):
     error: Mapped[str | None] = mapped_column(Text)
     # 产出分析的模型名
     model: Mapped[str | None] = mapped_column("model", String)
+    # 检测到的源语言 ISO 639-1 代码（detect_and_translate 节点产出；zh/unknown/外文码，未翻译为空）
+    source_language: Mapped[str | None] = mapped_column(String)
+    # 主题中文译文，仅非中文业务邮件非空
+    translated_subject: Mapped[str | None] = mapped_column(Text)
+    # 正文中文译文，仅非中文业务邮件非空
+    translated_text: Mapped[str | None] = mapped_column(Text)
     # 首次分析时间
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now_utc, nullable=False
@@ -342,6 +348,9 @@ class EmailAnalysis(Base):
         status: str = "analyzed",
         error: str | None = None,
         model: str | None = None,
+        source_language: str | None = None,
+        translated_subject: str | None = None,
+        translated_text: str | None = None,
     ) -> None:
         """构造后校验：确保白名单字段值合法，必填字段非空。"""
         if not isinstance(email_id, int) or email_id <= 0:
@@ -379,3 +388,6 @@ class EmailAnalysis(Base):
         self.status = status
         self.error = error
         self.model = model
+        self.source_language = source_language
+        self.translated_subject = translated_subject
+        self.translated_text = translated_text

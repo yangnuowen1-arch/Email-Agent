@@ -96,6 +96,10 @@ class EmailCoordinator:
                     suggested_tools=result.get("suggested_tools", []),
                     status="analyzed",
                     model=result.get("llm_model"),
+                    # 译文类字段无默认值兜底：中文/垃圾邮件/失败路径本就无译文
+                    source_language=result.get("source_language"),
+                    translated_subject=result.get("translated_subject"),
+                    translated_text=result.get("translated_text"),
                 )
 
                 if error_info is not None:

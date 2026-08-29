@@ -9,17 +9,20 @@ from uuid import uuid4
 import pytest
 import structlog
 from langchain_core.messages import BaseMessage, HumanMessage
+from langgraph.graph import END
 from structlog.testing import capture_logs
 
 from app.agent import trace_handle
 from app.agent.analysis_graph import (
     EmailAnalysisState,
     _analyze_node,
+    _detect_language_and_translate_node,
+    _route_translation_by_primary_intent,
     build_email_analysis_graph,
 )
 from app.agent.errors import LLMInvocationError
 from app.agent.trace_handle import GraphTraceHandler
-from app.schemas.analysis import EmailAnalysisOutput, IntentDetail
+from app.schemas.analysis import EmailAnalysisOutput, EmailTranslationOutput, IntentDetail
 
 # ---------------------------------------------------------------------------
 # FakeChatModel（鸭子类型，模拟 with_structured_output）
@@ -27,23 +30,26 @@ from app.schemas.analysis import EmailAnalysisOutput, IntentDetail
 
 
 class _FakeStructuredRunnable:
-    """按调用次数弹出 outcomes：Exception 则抛出，其余经 EmailAnalysisOutput 校验返回。
+    """按构造时传入的 schema 校验 outcomes：Exception 则抛出，其余经 schema 校验返回。
 
     outcomes 只剩一个时重复它（RetryPolicy 重试且无后续结果时保持同样表现）。
+    每次调用向 model.calls 记录 (schema 类名, 收到的 messages)，供断言调用次数与内容。
     """
 
-    def __init__(self, outcomes: list[Any], model: FakeChatModel) -> None:
+    def __init__(self, outcomes: list[Any], schema: Any, model: FakeChatModel) -> None:
         self._outcomes = outcomes
+        self._schema = schema
         self._model = model
 
     async def ainvoke(self, messages: list[BaseMessage], **kwargs: Any) -> Any:
         self._model.received_config = kwargs.get("config")
+        self._model.calls.append((self._schema.__name__, messages))
         outcome = self._outcomes.pop(0) if len(self._outcomes) > 1 else self._outcomes[0]
         if isinstance(outcome, Exception):
             raise outcome
-        if isinstance(outcome, EmailAnalysisOutput):
+        if isinstance(outcome, self._schema):
             return outcome
-        return EmailAnalysisOutput.model_validate(outcome)
+        return self._schema.model_validate(outcome)
 
 
 class FakeChatModel:
@@ -53,18 +59,25 @@ class FakeChatModel:
         output: Any = None,
         error: Exception | None = None,
         flaky: Exception | None = None,
+        outcomes: list[Any] | None = None,
     ):
-        """``flaky``：首次调用抛该异常，之后按 output/error 表现（验证 RetryPolicy）。"""
-        outcomes: list[Any] = []
-        if flaky is not None:
-            outcomes.append(flaky)
-        outcomes.append(error if error is not None else output)
+        """``flaky``：首次调用抛该异常，之后按 output/error 表现（验证 RetryPolicy）。
+
+        ``outcomes``：多节点图的整段调用队列（如 [分析输出, 翻译输出]），
+        按节点执行顺序依次消费；未提供时按 output/error/flaky 组装单节点表现。
+        """
+        if outcomes is None:
+            outcomes = []
+            if flaky is not None:
+                outcomes.append(flaky)
+            outcomes.append(error if error is not None else output)
         self._outcomes = outcomes
         self.model_name = "fake-model"
         self.received_config: Any = None
+        self.calls: list[tuple[str, list[BaseMessage]]] = []
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> _FakeStructuredRunnable:
-        return _FakeStructuredRunnable(self._outcomes, self)
+        return _FakeStructuredRunnable(self._outcomes, schema, self)
 
 
 # ---------------------------------------------------------------------------
@@ -85,12 +98,12 @@ def _base_state(**overrides: Any) -> EmailAnalysisState:
     return defaults
 
 
-def _success_output() -> EmailAnalysisOutput:
+def _analysis_success_output(intent: str = "cancel_order") -> EmailAnalysisOutput:
     return EmailAnalysisOutput(
-        primary_intent="cancel_order",
+        primary_intent=intent,
         intents=[
             IntentDetail(
-                category="cancel_order",
+                category=intent,
                 confidence=0.95,
                 reasoning="用户明确要求取消订单 ORD-123",
             )
@@ -103,13 +116,21 @@ def _success_output() -> EmailAnalysisOutput:
     )
 
 
+def _translation_success_output() -> EmailTranslationOutput:
+    return EmailTranslationOutput(
+        detected_language="en",
+        translated_subject="取消订单 ORD-123 的请求",
+        translated_text="请帮我取消订单 ORD-123",
+    )
+
+
 # ---------------------------------------------------------------------------
 # analyze_node 测试
 # ---------------------------------------------------------------------------
 
 
 async def test_analyze_node_normal() -> None:
-    model = FakeChatModel(output=_success_output())
+    model = FakeChatModel(output=_analysis_success_output())
     result = await _analyze_node(_base_state(), chat_model=model)
 
     assert result["primary_intent"] == "cancel_order"
@@ -150,9 +171,77 @@ async def test_analyze_node_out_of_whitelist_intent_fails() -> None:
 
 async def test_analyze_node_empty_body() -> None:
     """空 cleaned_text → prompt 含 (正文为空)。"""
-    model = FakeChatModel(output=_success_output())
+    model = FakeChatModel(output=_analysis_success_output())
     result = await _analyze_node(_base_state(cleaned_text=""), chat_model=model)
     assert result.get("primary_intent") == "cancel_order"
+
+
+# ---------------------------------------------------------------------------
+# detect_and_translate_node 测试
+# ---------------------------------------------------------------------------
+
+
+async def test_detect_and_translate_node_translates_foreign_email() -> None:
+    """外文邮件 → 调 LLM 检测+翻译，产出语言码与中文译文。"""
+    model = FakeChatModel(output=_translation_success_output())
+    state = _base_state(subject="Please cancel order ORD-123", cleaned_text="I want a refund")
+    result = await _detect_language_and_translate_node(state, chat_model=model)
+
+    assert result["source_language"] == "en"
+    assert result["translated_subject"] == "取消订单 ORD-123 的请求"
+    assert result["translated_text"] == "请帮我取消订单 ORD-123"
+    assert model.calls[0][0] == "EmailTranslationOutput"
+
+
+async def test_detect_and_translate_node_skips_llm_for_chinese_text() -> None:
+    """中文邮件 → 启发式命中，零 LLM 调用，仅标记源语言 zh。"""
+    model = FakeChatModel(output=_translation_success_output())
+    result = await _detect_language_and_translate_node(_base_state(), chat_model=model)
+
+    assert result == {"source_language": "zh"}
+    assert model.calls == []
+
+
+async def test_detect_and_translate_node_returns_unknown_for_empty_content() -> None:
+    """主题与正文均为空 → 无内容可翻译，不调 LLM，标记 unknown。"""
+    model = FakeChatModel(output=_translation_success_output())
+    result = await _detect_language_and_translate_node(
+        _base_state(subject="", cleaned_text=""), chat_model=model
+    )
+
+    assert result == {"source_language": "unknown"}
+    assert model.calls == []
+
+
+async def test_detect_and_translate_node_wraps_llm_error() -> None:
+    """LLM 调用失败 → 包装为 LLMInvocationError，异常链保留原始异常。"""
+    model = FakeChatModel(error=RuntimeError("LLM timeout"))
+    state = _base_state(subject="Please cancel order ORD-123")
+    with pytest.raises(LLMInvocationError) as exc_info:
+        await _detect_language_and_translate_node(state, chat_model=model)
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# 翻译路由测试（analyze 后的条件边）
+# ---------------------------------------------------------------------------
+
+
+def test_route_translation_by_primary_intent_spam_ends() -> None:
+    """垃圾/通知类意图 → 直接结束，不进检测翻译节点。"""
+    assert (
+        _route_translation_by_primary_intent({**_base_state(), "primary_intent": "spam_or_notice"})
+        == END
+    )
+
+
+def test_route_translation_by_primary_intent_business_enters_detect_and_translate() -> None:
+    """业务意图（售前售后）→ 进检测翻译节点。"""
+    assert (
+        _route_translation_by_primary_intent({**_base_state(), "primary_intent": "refund_request"})
+        == "detect_and_translate"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +251,7 @@ async def test_analyze_node_empty_body() -> None:
 
 async def test_compiled_graph_normal_path() -> None:
     """端到端跑编译后的图，验证 analyze 节点正确执行。"""
-    model = FakeChatModel(output=_success_output())
+    model = FakeChatModel(output=_analysis_success_output())
     graph = build_email_analysis_graph(model)
 
     result = await graph.ainvoke(_base_state())
@@ -187,12 +276,57 @@ async def test_compiled_graph_llm_error_path() -> None:
 
 async def test_compiled_graph_retries_then_succeeds() -> None:
     """RetryPolicy：首次 LLM 调用失败自动重试一次，第二次成功则正常返回。"""
-    model = FakeChatModel(output=_success_output(), flaky=RuntimeError("transient"))
+    model = FakeChatModel(output=_analysis_success_output(), flaky=RuntimeError("transient"))
     graph = build_email_analysis_graph(model)
 
     result = await graph.ainvoke(_base_state())
 
     assert result["primary_intent"] == "cancel_order"
+
+
+async def test_compiled_graph_translates_foreign_business_email() -> None:
+    """外文业务邮件全流程：analyze（原文）→ detect_and_translate，两次调用、译文入终态。"""
+    model = FakeChatModel(outcomes=[_analysis_success_output(), _translation_success_output()])
+    graph = build_email_analysis_graph(model)
+    state = _base_state(subject="Please cancel order ORD-123", cleaned_text="I want a refund")
+
+    result = await graph.ainvoke(state)
+
+    assert result["primary_intent"] == "cancel_order"
+    assert result["source_language"] == "en"
+    assert result["translated_subject"] == "取消订单 ORD-123 的请求"
+    assert result["translated_text"] == "请帮我取消订单 ORD-123"
+    assert [name for name, _ in model.calls] == [
+        "EmailAnalysisOutput",
+        "EmailTranslationOutput",
+    ]
+
+
+async def test_compiled_graph_skips_detect_and_translate_for_spam() -> None:
+    """垃圾邮件：只花 1 次 analyze 调用，不进检测翻译节点，无译文产出。"""
+    model = FakeChatModel(output=_analysis_success_output(intent="spam_or_notice"))
+    graph = build_email_analysis_graph(model)
+    state = _base_state(subject="You won a prize!", cleaned_text="Click here now")
+
+    result = await graph.ainvoke(state)
+
+    assert result["primary_intent"] == "spam_or_notice"
+    assert "source_language" not in result
+    assert "translated_subject" not in result
+    assert "translated_text" not in result
+    assert len(model.calls) == 1
+
+
+async def test_compiled_graph_chinese_email_needs_only_one_llm_call() -> None:
+    """中文业务邮件：路由进检测翻译节点但启发式短路，全程仅 1 次 LLM 调用。"""
+    model = FakeChatModel(output=_analysis_success_output())
+    graph = build_email_analysis_graph(model)
+
+    result = await graph.ainvoke(_base_state())
+
+    assert result["primary_intent"] == "cancel_order"
+    assert result["source_language"] == "zh"
+    assert [name for name, _ in model.calls] == ["EmailAnalysisOutput"]
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +376,7 @@ def test_trace_handler_dump_returns_copy() -> None:
 async def test_compiled_graph_captures_trace_events() -> None:
     """带 callbacks 跑编译后的图，捕获 graph/analyze 节点链路且父子关联完整。"""
     handler = GraphTraceHandler()
-    model = FakeChatModel(output=_success_output())
+    model = FakeChatModel(output=_analysis_success_output())
     graph = build_email_analysis_graph(model)
 
     result = await graph.ainvoke(_base_state(), config={"callbacks": [handler]})
@@ -259,7 +393,7 @@ async def test_compiled_graph_captures_trace_events() -> None:
 
 async def test_compiled_graph_propagates_config_to_llm() -> None:
     """config 注入节点并穿透到内层 runnable，否则 LLM 事件无法进入调用树。"""
-    model = FakeChatModel(output=_success_output())
+    model = FakeChatModel(output=_analysis_success_output())
     graph = build_email_analysis_graph(model)
     handler = GraphTraceHandler()
 
@@ -282,9 +416,7 @@ async def test_handler_emits_structlog_events() -> None:
         handler.on_llm_end(_FakeResponse(), run_id=llm_run)
         handler.on_chain_error(RuntimeError("boom"), run_id=chain_run)
 
-    assert {"llm_call_start", "llm_call_done", "graph_chain_error"} <= {
-        e["event"] for e in cap
-    }
+    assert {"llm_call_start", "llm_call_done", "graph_chain_error"} <= {e["event"] for e in cap}
 
     start = next(e for e in cap if e["event"] == "llm_call_start")
     assert start["prompt_chars"] == len("hello")
@@ -314,7 +446,7 @@ async def test_contextvars_flow_into_handler_logs(monkeypatch) -> None:
     monkeypatch.setattr(trace_handle, "logger", test_logger)
 
     with structlog.contextvars.bound_contextvars(email_id=7):
-        model = FakeChatModel(output=_success_output())
+        model = FakeChatModel(output=_analysis_success_output())
         graph = build_email_analysis_graph(model)
         await graph.ainvoke(_base_state(), config={"callbacks": [GraphTraceHandler()]})
 
