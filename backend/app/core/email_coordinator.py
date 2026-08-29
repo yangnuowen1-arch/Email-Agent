@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
-from app.agent.analysis_graph import GraphTraceHandler, build_email_analysis_graph
+import structlog
+
+from app.agent.analysis_graph import build_email_analysis_graph
 from app.agent.errors import AnalysisGraphError
+from app.agent.trace_handle import GraphTraceHandler
 from app.core.settings import AppConfig
 from app.db.db import EmailAnalysis, EmailMessage
 from app.db.engine import Database
@@ -57,58 +60,61 @@ class EmailCoordinator:
         }
 
         trace = GraphTraceHandler()
-        try:
-            result: dict = await self._analysis_graph.ainvoke(
-                initial, config={"callbacks": [trace]}
-            )
-            error_info: AnalysisGraphError | None = None
-        except AnalysisGraphError as exc:
-            # 图内可预期失败（LLM 调用类）；逻辑 bug 等意外异常继续向上抛
-            self._logger.error(
-                "analysis_graph_failed",
-                email_id=email.id,
-                error_type=type(exc).__name__,
-                error=str(exc)[:500],
-                exc_info=True,
-            )
-            result, error_info = {}, exc
-        finally:
-            self._logger.info("graph_trace", email_id=email.id, events=trace.dump())
+        # 业务上下文经 contextvars 注入，全链路日志（含 GraphTraceHandler 回调）自动携带；
+        # 异步安全：绑定随 asyncio task 复制，批处理循环内互不污染
+        with structlog.contextvars.bound_contextvars(
+            email_id=email.id, account_id=email.account_id
+        ):
+            try:
+                result: dict = await self._analysis_graph.ainvoke(
+                    initial, config={"callbacks": [trace]}
+                )
+                error_info: AnalysisGraphError | None = None
+            except AnalysisGraphError as exc:
+                # 图内可预期失败（LLM 调用类）；逻辑 bug 等意外异常继续向上抛
+                self._logger.error(
+                    "analysis_graph_failed",
+                    email_id=email.id,
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:500],
+                    exc_info=True,
+                )
+                result, error_info = {}, exc
 
-        # 4. 落库分析结果（成功或失败兜底）
-        async with self._database.session() as session:
-            repo = EmailAnalysisRepository(session)
-            entity = EmailAnalysis(
-                email_id=email.id,
-                account_id=email.account_id,
-                primary_intent=result.get("primary_intent", UNKNOWN_INTENT),
-                intents=result.get("intents", []),
-                reasoning_summary=result.get("reasoning_summary", ""),
-                entities=result.get("entities", {}),
-                sentiment=result.get("sentiment", "neutral"),
-                priority=result.get("priority", "P2"),
-                suggested_tools=result.get("suggested_tools", []),
-                status="analyzed",
-                model=result.get("llm_model"),
-            )
+            # 4. 落库分析结果（成功或失败兜底）
+            async with self._database.session() as session:
+                repo = EmailAnalysisRepository(session)
+                entity = EmailAnalysis(
+                    email_id=email.id,
+                    account_id=email.account_id,
+                    primary_intent=result.get("primary_intent", UNKNOWN_INTENT),
+                    intents=result.get("intents", []),
+                    reasoning_summary=result.get("reasoning_summary", ""),
+                    entities=result.get("entities", {}),
+                    sentiment=result.get("sentiment", "neutral"),
+                    priority=result.get("priority", "P2"),
+                    suggested_tools=result.get("suggested_tools", []),
+                    status="analyzed",
+                    model=result.get("llm_model"),
+                )
 
-            if error_info is not None:
-                entity.priority = "P1"
-                entity.sentiment = "neutral"
-                entity.status = "failed"
-                entity.error = str(error_info)
+                if error_info is not None:
+                    entity.priority = "P1"
+                    entity.sentiment = "neutral"
+                    entity.status = "failed"
+                    entity.error = str(error_info)
 
-            saved = await repo.upsert_email_analysis(entity)
+                saved = await repo.upsert_email_analysis(entity)
 
-        return {
-            "email_id": email.id,
-            "analysis_id": saved.id,
-            "status": "failed" if error_info is not None else "analyzed",
-            "primary_intent": result.get("primary_intent", UNKNOWN_INTENT),
-            "priority": result.get("priority", "P2"),
-            "error": str(error_info) if error_info is not None else None,
-            "error_type": type(error_info).__name__ if error_info is not None else None,
-        }
+            return {
+                "email_id": email.id,
+                "analysis_id": saved.id,
+                "status": "failed" if error_info is not None else "analyzed",
+                "primary_intent": result.get("primary_intent", UNKNOWN_INTENT),
+                "priority": result.get("priority", "P2"),
+                "error": str(error_info) if error_info is not None else None,
+                "error_type": type(error_info).__name__ if error_info is not None else None,
+            }
 
     async def start_analyze(self, *, account_id: int | None = None, limit: int = 20) -> list[dict]:
 

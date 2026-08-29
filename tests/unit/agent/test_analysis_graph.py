@@ -7,15 +7,18 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import BaseMessage
+import structlog
+from langchain_core.messages import BaseMessage, HumanMessage
+from structlog.testing import capture_logs
 
+from app.agent import trace_handle
 from app.agent.analysis_graph import (
     EmailAnalysisState,
-    GraphTraceHandler,
     _analyze_node,
     build_email_analysis_graph,
 )
 from app.agent.errors import LLMInvocationError
+from app.agent.trace_handle import GraphTraceHandler
 from app.schemas.analysis import EmailAnalysisOutput, IntentDetail
 
 # ---------------------------------------------------------------------------
@@ -264,3 +267,57 @@ async def test_compiled_graph_propagates_config_to_llm() -> None:
 
     assert model.received_config is not None
     assert "callbacks" in model.received_config
+
+
+async def test_handler_emits_structlog_events() -> None:
+    """handler 在收集事件的同时实时发出 structlog 日志（含 usage、prompt 长度与异常）。"""
+    handler = GraphTraceHandler()
+    llm_run = uuid4()
+    chain_run = uuid4()
+
+    with capture_logs() as cap:
+        handler.on_chat_model_start(
+            None, [[HumanMessage(content="hello")]], run_id=llm_run, name="fake-model"
+        )
+        handler.on_llm_end(_FakeResponse(), run_id=llm_run)
+        handler.on_chain_error(RuntimeError("boom"), run_id=chain_run)
+
+    assert {"llm_call_start", "llm_call_done", "graph_chain_error"} <= {
+        e["event"] for e in cap
+    }
+
+    start = next(e for e in cap if e["event"] == "llm_call_start")
+    assert start["prompt_chars"] == len("hello")
+
+    done = next(e for e in cap if e["event"] == "llm_call_done")
+    assert done["usage"] == {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    assert done["elapsed_ms"] >= 0
+
+    err = next(e for e in cap if e["event"] == "graph_chain_error")
+    assert isinstance(err["exc_info"], RuntimeError)
+
+
+async def test_contextvars_flow_into_handler_logs(monkeypatch) -> None:
+    """业务上下文（bound_contextvars）经 merge_contextvars 合并进 handler 发出的日志。"""
+    captured: list[dict[str, Any]] = []
+
+    def _capture(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+        captured.append(event_dict)
+        return event_dict
+
+    # 直接给 handler 注入带 merge_contextvars 的独立 logger，
+    # 绕开全局 structlog 配置与 cache_logger_on_first_use 缓存
+    test_logger = structlog.wrap_logger(
+        structlog.ReturnLogger(),
+        processors=[structlog.contextvars.merge_contextvars, _capture],
+    )
+    monkeypatch.setattr(trace_handle, "logger", test_logger)
+
+    with structlog.contextvars.bound_contextvars(email_id=7):
+        model = FakeChatModel(output=_success_output())
+        graph = build_email_analysis_graph(model)
+        await graph.ainvoke(_base_state(), config={"callbacks": [GraphTraceHandler()]})
+
+    # FakeChatModel 非 langchain Runnable，不触发 LLM 级回调；chain 事件由 langgraph 发出
+    starts = [e for e in captured if e.get("event") == "graph_chain_start"]
+    assert starts and starts[0]["email_id"] == 7

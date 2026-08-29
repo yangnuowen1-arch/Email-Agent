@@ -18,6 +18,7 @@ def _build_shared_processors() -> list:
     标准库 handler 自身已做级别过滤，无需重复。
     """
     return [
+        structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
         structlog.stdlib.PositionalArgumentsFormatter(),
