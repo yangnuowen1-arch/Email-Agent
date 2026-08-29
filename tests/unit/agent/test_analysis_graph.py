@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from langchain_core.messages import BaseMessage
 
 from app.agent.analysis_graph import (
@@ -14,6 +15,7 @@ from app.agent.analysis_graph import (
     _analyze_node,
     build_email_analysis_graph,
 )
+from app.agent.errors import LLMInvocationError
 from app.schemas.analysis import EmailAnalysisOutput, IntentDetail
 
 # ---------------------------------------------------------------------------
@@ -22,30 +24,44 @@ from app.schemas.analysis import EmailAnalysisOutput, IntentDetail
 
 
 class _FakeStructuredRunnable:
-    def __init__(self, result: Any, model: FakeChatModel) -> None:
-        self._result = result
+    """按调用次数弹出 outcomes：Exception 则抛出，其余经 EmailAnalysisOutput 校验返回。
+
+    outcomes 只剩一个时重复它（RetryPolicy 重试且无后续结果时保持同样表现）。
+    """
+
+    def __init__(self, outcomes: list[Any], model: FakeChatModel) -> None:
+        self._outcomes = outcomes
         self._model = model
 
     async def ainvoke(self, messages: list[BaseMessage], **kwargs: Any) -> Any:
         self._model.received_config = kwargs.get("config")
-        if isinstance(self._result, Exception):
-            raise self._result
-        if isinstance(self._result, EmailAnalysisOutput):
-            return self._result
-        return EmailAnalysisOutput.model_validate(self._result)
+        outcome = self._outcomes.pop(0) if len(self._outcomes) > 1 else self._outcomes[0]
+        if isinstance(outcome, Exception):
+            raise outcome
+        if isinstance(outcome, EmailAnalysisOutput):
+            return outcome
+        return EmailAnalysisOutput.model_validate(outcome)
 
 
 class FakeChatModel:
-    def __init__(self, *, output: Any = None, error: Exception | None = None):
-        self._output = output
-        self._error = error
+    def __init__(
+        self,
+        *,
+        output: Any = None,
+        error: Exception | None = None,
+        flaky: Exception | None = None,
+    ):
+        """``flaky``：首次调用抛该异常，之后按 output/error 表现（验证 RetryPolicy）。"""
+        outcomes: list[Any] = []
+        if flaky is not None:
+            outcomes.append(flaky)
+        outcomes.append(error if error is not None else output)
+        self._outcomes = outcomes
         self.model_name = "fake-model"
         self.received_config: Any = None
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> _FakeStructuredRunnable:
-        if self._error:
-            return _FakeStructuredRunnable(self._error, self)
-        return _FakeStructuredRunnable(self._output, self)
+        return _FakeStructuredRunnable(self._outcomes, self)
 
 
 # ---------------------------------------------------------------------------
@@ -103,22 +119,21 @@ async def test_analyze_node_normal() -> None:
 
 async def test_analyze_node_llm_error() -> None:
     model = FakeChatModel(error=RuntimeError("LLM timeout"))
-    result = await _analyze_node(_base_state(), chat_model=model)
+    with pytest.raises(LLMInvocationError) as exc_info:
+        await _analyze_node(_base_state(), chat_model=model)
 
-    assert result.get("error") is not None
-    assert "RuntimeError" in result["error"]
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
 async def test_analyze_node_invalid_output() -> None:
-    """模型返回非法值（intents=[]）导致 Pydantic 校验失败。"""
+    """模型返回非法值（intents=[]）导致 Pydantic 校验失败 → 包装为解析失败异常。"""
     model = FakeChatModel(output={"primary_intent": "x", "intents": [], "reasoning_summary": "t"})
-    result = await _analyze_node(_base_state(), chat_model=model)
+    with pytest.raises(LLMInvocationError, match="LLM 输出解析失败"):
+        await _analyze_node(_base_state(), chat_model=model)
 
-    assert result.get("error") is not None
 
-
-async def test_analyze_node_out_of_whitelist_intent_falls_back() -> None:
-    """LLM 返回白名单外意图 → Pydantic 校验失败 → error。"""
+async def test_analyze_node_out_of_whitelist_intent_fails() -> None:
+    """LLM 返回白名单外意图 → Pydantic 校验失败 → 解析失败异常。"""
     model = FakeChatModel(
         output={
             "primary_intent": "resume_request",
@@ -126,9 +141,8 @@ async def test_analyze_node_out_of_whitelist_intent_falls_back() -> None:
             "reasoning_summary": "t",
         }
     )
-    result = await _analyze_node(_base_state(), chat_model=model)
-
-    assert result.get("error") is not None
+    with pytest.raises(LLMInvocationError, match="LLM 输出解析失败"):
+        await _analyze_node(_base_state(), chat_model=model)
 
 
 async def test_analyze_node_empty_body() -> None:
@@ -156,14 +170,26 @@ async def test_compiled_graph_normal_path() -> None:
 
 
 async def test_compiled_graph_llm_error_path() -> None:
-    """端到端：LLM 失败 → error 字段有值。"""
+    """端到端：LLM 失败（重试耗尽）→ 异常穿透 ainvoke，chain_error 进入追踪。"""
+    handler = GraphTraceHandler()
     model = FakeChatModel(error=RuntimeError("timeout"))
+    graph = build_email_analysis_graph(model)
+
+    with pytest.raises(LLMInvocationError) as exc_info:
+        await graph.ainvoke(_base_state(), config={"callbacks": [handler]})
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert any(e["type"] == "chain_error" for e in handler.dump())
+
+
+async def test_compiled_graph_retries_then_succeeds() -> None:
+    """RetryPolicy：首次 LLM 调用失败自动重试一次，第二次成功则正常返回。"""
+    model = FakeChatModel(output=_success_output(), flaky=RuntimeError("transient"))
     graph = build_email_analysis_graph(model)
 
     result = await graph.ainvoke(_base_state())
 
-    assert result.get("error") is not None
-    assert "RuntimeError" in result["error"]
+    assert result["primary_intent"] == "cancel_order"
 
 
 # ---------------------------------------------------------------------------

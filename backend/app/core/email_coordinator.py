@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from app.agent.analysis_graph import GraphTraceHandler, build_email_analysis_graph
+from app.agent.errors import AnalysisGraphError
 from app.core.settings import AppConfig
 from app.db.db import EmailAnalysis, EmailMessage
 from app.db.engine import Database
@@ -56,8 +57,23 @@ class EmailCoordinator:
         }
 
         trace = GraphTraceHandler()
-        result = await self._analysis_graph.ainvoke(initial, config={"callbacks": [trace]})
-        self._logger.info("graph_trace", email_id=email.id, events=trace.dump())
+        try:
+            result: dict = await self._analysis_graph.ainvoke(
+                initial, config={"callbacks": [trace]}
+            )
+            error_info: AnalysisGraphError | None = None
+        except AnalysisGraphError as exc:
+            # 图内可预期失败（LLM 调用类）；逻辑 bug 等意外异常继续向上抛
+            self._logger.error(
+                "analysis_graph_failed",
+                email_id=email.id,
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+                exc_info=True,
+            )
+            result, error_info = {}, exc
+        finally:
+            self._logger.info("graph_trace", email_id=email.id, events=trace.dump())
 
         # 4. 落库分析结果（成功或失败兜底）
         async with self._database.session() as session:
@@ -76,21 +92,22 @@ class EmailCoordinator:
                 model=result.get("llm_model"),
             )
 
-            if result.get("error"):
+            if error_info is not None:
                 entity.priority = "P1"
                 entity.sentiment = "neutral"
                 entity.status = "failed"
-                entity.error = result["error"]
+                entity.error = str(error_info)
 
             saved = await repo.upsert_email_analysis(entity)
 
         return {
             "email_id": email.id,
             "analysis_id": saved.id,
-            "status": result.get("error") and "failed" or "analyzed",
+            "status": "failed" if error_info is not None else "analyzed",
             "primary_intent": result.get("primary_intent", UNKNOWN_INTENT),
             "priority": result.get("priority", "P2"),
-            "error": result.get("error"),
+            "error": str(error_info) if error_info is not None else None,
+            "error_type": type(error_info).__name__ if error_info is not None else None,
         }
 
     async def start_analyze(self, *, account_id: int | None = None, limit: int = 20) -> list[dict]:

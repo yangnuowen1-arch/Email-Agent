@@ -12,6 +12,11 @@
     result = await graph.ainvoke(initial_state, config={"callbacks": [handler]})
     logger.info("graph_trace", events=handler.dump())
 
+错误处理：LLM 调用失败统一抛 ``LLMInvocationError``，原样穿透 ``ainvoke``
+（LangGraph 不包装节点异常，异常链保留在 ``__cause__``），由调用方
+``except AnalysisGraphError`` 捕获；节点其余逻辑错误不捕获、原样传播。
+LLMInvocationError 由节点级 RetryPolicy 自动重试一次。
+
 依赖全部闭包注入，无模块级全局，不触碰 DB。
 """
 
@@ -20,15 +25,19 @@ from __future__ import annotations
 import asyncio
 import time
 from functools import partial
-from typing import Any, Optional, TypedDict
+from typing import Any, NoReturn, Optional, TypedDict
 from uuid import UUID
 
 import structlog
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
+from langgraph.types import RetryPolicy
+from pydantic import ValidationError
 
+from app.agent.errors import LLMInvocationError
 from app.agent.prompts import EMAIL_ANALYSIS_SYSTEM_PROMPT
 from app.schemas.analysis import EmailAnalysisOutput
 from app.services.preprocess import compose_email_view
@@ -62,9 +71,6 @@ class EmailAnalysisState(TypedDict, total=False):
     priority: str
     suggested_tools: list[str]
     llm_model: str
-
-    # 错误标记（analyze 失败时设置）
-    error: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -185,10 +191,11 @@ async def _analyze_node(
 
     langgraph 会把运行时 config 注入到名为 ``config`` 的参数中；
     节点内必须把 config 继续传给内层 runnable，LLM 调用才会进入调用链追踪。
-    """
-    if state.get("error"):
-        return {}
 
+    LLM 调用失败（超时 / 网络 / 解析失败等）统一抛 ``LLMInvocationError``，
+    由节点级 RetryPolicy 重试一次、重试耗尽后穿透 ``ainvoke``；
+    节点其余逻辑（清洗视图组装等）的错误不捕获，原样传播以暴露代码 bug。
+    """
     email_id = state.get("email_id", "?")
 
     cleaned = state.get("cleaned_text", "")
@@ -208,6 +215,19 @@ async def _analyze_node(
 
     t0 = time.monotonic()
 
+    def _fail(message: str, exc: Exception) -> NoReturn:
+        """记录失败日志后以类型化异常上抛，原始异常保留在 __cause__。"""
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        logger.error(
+            "llm_analysis_failed",
+            email_id=email_id,
+            elapsed_ms=round(elapsed_ms, 1),
+            error_type=type(exc).__name__,
+            error_message=message[:500],
+            exc_info=True,
+        )
+        raise LLMInvocationError(message) from exc
+
     try:
         structured = chat_model.with_structured_output(
             EmailAnalysisOutput, method="function_calling"
@@ -222,44 +242,39 @@ async def _analyze_node(
             ),
             timeout=120,
         )
-        if result is None:
-            logger.error("llm_analysis_returned_none", email_id=email_id)
-            return {"error": "LLM returned None"}
-
-        elapsed_ms = (time.monotonic() - t0) * 1000
-        usage = getattr(result, "response_metadata", {}).get("token_usage", {})
-
-        logger.info(
-            "llm_analysis_done",
-            email_id=email_id,
-            model=getattr(chat_model, "model_name", "unknown"),
-            elapsed_ms=round(elapsed_ms, 1),
-            prompt_tokens=usage.get("prompt_tokens"),
-            completion_tokens=usage.get("completion_tokens"),
-        )
-
-        return {
-            "primary_intent": result.primary_intent,
-            "intents": [i.model_dump() for i in result.intents],
-            "reasoning_summary": result.reasoning_summary,
-            "entities": result.entities,
-            "sentiment": result.sentiment,
-            "priority": result.priority,
-            "suggested_tools": result.suggested_tools,
-            "llm_model": getattr(chat_model, "model_name", "unknown"),
-        }
-
+    except asyncio.TimeoutError as exc:
+        _fail("LLM 调用超时（120s）", exc)
+    except (OutputParserException, ValidationError) as exc:
+        _fail(f"LLM 输出解析失败: {exc}", exc)
     except Exception as exc:  # noqa: BLE001
-        elapsed_ms = (time.monotonic() - t0) * 1000
-        logger.error(
-            "llm_analysis_failed",
-            email_id=email_id,
-            elapsed_ms=round(elapsed_ms, 1),
-            error_type=type(exc).__name__,
-            error_message=str(exc)[:500],
-            exc_info=True,
-        )
-        return {"error": f"{type(exc).__name__}: {exc}"}
+        _fail(f"{type(exc).__name__}: {exc}", exc)
+
+    if result is None:
+        logger.error("llm_analysis_returned_none", email_id=email_id)
+        raise LLMInvocationError("LLM returned None")
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    usage = getattr(result, "response_metadata", {}).get("token_usage", {})
+
+    logger.info(
+        "llm_analysis_done",
+        email_id=email_id,
+        model=getattr(chat_model, "model_name", "unknown"),
+        elapsed_ms=round(elapsed_ms, 1),
+        prompt_tokens=usage.get("prompt_tokens"),
+        completion_tokens=usage.get("completion_tokens"),
+    )
+
+    return {
+        "primary_intent": result.primary_intent,
+        "intents": [i.model_dump() for i in result.intents],
+        "reasoning_summary": result.reasoning_summary,
+        "entities": result.entities,
+        "sentiment": result.sentiment,
+        "priority": result.priority,
+        "suggested_tools": result.suggested_tools,
+        "llm_model": getattr(chat_model, "model_name", "unknown"),
+    }
 
 
 def build_email_analysis_graph(chat_model: Any):
@@ -267,11 +282,18 @@ def build_email_analysis_graph(chat_model: Any):
 
     调用链追踪：ainvoke 时传 ``config={"callbacks": [GraphTraceHandler()]}``，
     结束后由 ``handler.dump()`` 取事件列表（用法见模块 docstring）。
+
+    analyze 节点挂 RetryPolicy：仅对 LLMInvocationError 重试一次
+    （max_attempts=2 含首次），重试耗尽后异常原样抛给 ainvoke 调用方。
     """
 
     builder = StateGraph(EmailAnalysisState)
 
-    builder.add_node("analyze", partial(_analyze_node, chat_model=chat_model))
+    builder.add_node(
+        "analyze",
+        partial(_analyze_node, chat_model=chat_model),
+        retry_policy=RetryPolicy(max_attempts=2, retry_on=(LLMInvocationError,)),
+    )
 
     builder.add_edge("analyze", END)
 
