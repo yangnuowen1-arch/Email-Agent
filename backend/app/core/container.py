@@ -11,6 +11,7 @@ from app.db.engine import Database, build_database
 from app.observability import configure_logging
 from app.providers.email.base import AccountConfig, MailClient
 from app.providers.email.factory import create_client
+from app.providers.storage import CosAttachmentStorage
 from app.services.email import EmailService
 
 
@@ -32,12 +33,18 @@ class Container:
             raise AttributeError("Database URL is required")
         self._database = build_database(config)
 
+        # 附件对象存储：COS 未配置时为 None，下游降级为"仅元数据"
+        self._storage = (
+            CosAttachmentStorage(self._config.cos) if self._config.cos.cos_secret_id else None
+        )
+
         self._email = EmailService(client_factory=self._make_client_factory())
 
         self._listener = EmailListener(
             database=self._database,
             email_service=self._email,
             config=self._config,
+            attachment_storage=self._storage,
             logger=self._logger,
         )
 
@@ -45,6 +52,7 @@ class Container:
             config=self._config,
             database=self._database,
             logger=self._logger,
+            attachment_storage=self._storage,
         )
 
     def _make_client_factory(self):

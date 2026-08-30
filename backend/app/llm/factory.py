@@ -23,11 +23,7 @@ async def _log_request(request: httpx.Request) -> None:
 
 
 async def _log_response(response: httpx.Response) -> None:
-    logger.debug(
-        "llm_response",
-        status=response.status_code
-
-    )
+    logger.debug("llm_response", status=response.status_code)
 
 
 async def _log_error(error: Exception) -> None:
@@ -38,8 +34,11 @@ async def _log_error(error: Exception) -> None:
     )
 
 
-def build_chat_model(llm_config: LLMConfig) -> ChatOpenAI:
+def build_chat_model(llm_config: LLMConfig, *, model: str | None = None) -> ChatOpenAI:
     """按 LLMConfig 构建 ChatOpenAI，兼容任意 OpenAI 兼容端点。
+
+    ``model`` 用于覆盖配置中的默认模型名（如构建视觉模型客户端）；
+    为 None 时使用 ``llm_config.llm_model``。
 
     Raises LLMConfigurationError when no API key is configured.
     """
@@ -69,7 +68,7 @@ def build_chat_model(llm_config: LLMConfig) -> ChatOpenAI:
     )
 
     return ChatOpenAI(
-        model=llm_config.llm_model,
+        model=model or llm_config.llm_model,
         api_key=llm_config.llm_api_key,
         base_url=llm_config.llm_base_url,
         temperature=llm_config.llm_temperature,

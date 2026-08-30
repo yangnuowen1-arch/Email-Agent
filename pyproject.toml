@@ -15,6 +15,7 @@ dependencies = [
     "langchain-core>=0.3",
     "langchain-openai>=0.3",
     "beautifulsoup4>=4.12",
+    "cos-python-sdk-v5>=1.9",
 ]
 
 [project.optional-dependencies]

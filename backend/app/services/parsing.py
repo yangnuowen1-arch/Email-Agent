@@ -6,7 +6,10 @@ from email.header import decode_header
 from email.message import EmailMessage as StdEmailMessage
 from email.utils import getaddresses, parsedate_to_datetime
 
-from app.schemas import EmailData, RawEmail
+from app.schemas import EmailData, ParsedAttachment, RawEmail
+
+# 单附件字节上限：超过只保留元数据，不携带内容（不上传、不参与提取）
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 
 
 def _decode_subject(msg: StdEmailMessage) -> str:
@@ -214,6 +217,88 @@ def _extract_bodies(msg: StdEmailMessage) -> tuple[str | None, str | None]:
     return text_body, html_body
 
 
+def _attachment_kind(part: StdEmailMessage) -> str:
+    """按内容类型与文件名归类附件：email（.eml/message/rfc822）、image、document。"""
+    ctype = part.get_content_type()
+    filename = (part.get_filename() or "").lower()
+    if ctype == "message/rfc822" or filename.endswith(".eml"):
+        return "email"
+    if ctype.startswith("image/"):
+        return "image"
+    return "document"
+
+
+def _iter_attachment_parts(msg: StdEmailMessage):
+    """深度优先遍历 MIME 叶子部分；message/rfc822 整体产出、不下钻。
+
+    嵌套邮件（message/rfc822）由 :func:`parse_email` 递归解析单独处理，
+    若下钻会把它内部的正文/图片错误地当成外层邮件的附件重复收集。
+    """
+    queue: list[StdEmailMessage] = [msg]
+    while queue:
+        part = queue.pop(0)
+        if part.get_content_type() == "message/rfc822":
+            yield part
+            continue
+        if part.is_multipart():
+            payload = part.get_payload()
+            if isinstance(payload, list):
+                queue.extend(payload)
+            continue
+        yield part
+
+
+def _extract_attachments(msg: StdEmailMessage) -> list[ParsedAttachment]:
+    """收集全部附件（不再当噪声丢弃），按 kind 分类。
+
+    图片无论 inline（内嵌 cid 图）还是 attachment 都收集；email 类取整段
+    RFC822 字节供后续递归解析；其余类型仅收集 attachment 形态。
+    收集失败不影响正文入库，单附件超上限只保留元数据。
+    """
+    attachments: list[ParsedAttachment] = []
+    try:
+        for part in _iter_attachment_parts(msg):
+            ctype = part.get_content_type()
+            disposition = part.get_content_disposition()
+            filename = part.get_filename() or ""
+            is_email = _attachment_kind(part) == "email"
+            is_image = ctype.startswith("image/")
+            if not is_email and not is_image and disposition != "attachment":
+                continue
+            try:
+                if is_email:
+                    # message/rfc822 的内容为嵌套 EmailMessage，还原为完整字节；
+                    # 部分客户端以 octet-stream 传送 .eml，此时内容本身就是字节
+                    inner = part.get_content()
+                    if isinstance(inner, bytes):
+                        payload: bytes | None = inner
+                    elif hasattr(inner, "as_bytes"):
+                        payload = inner.as_bytes(policy=policy.default)
+                    else:
+                        payload = None
+                else:
+                    payload = part.get_payload(decode=True)
+            except Exception:
+                payload = None
+            content_id = part.get("Content-ID")
+            over_limit = payload is None or len(payload) > MAX_ATTACHMENT_BYTES
+            attachments.append(
+                ParsedAttachment(
+                    filename=filename,
+                    content_type=ctype,
+                    disposition=disposition,
+                    content_id=str(content_id).strip(" <>") if content_id else None,
+                    size=len(payload) if payload is not None else 0,
+                    content=None if over_limit else payload,
+                    kind=_attachment_kind(part),
+                )
+            )
+    except Exception:
+        # 附件收集异常时返回已收集部分，正文提取与入库不受影响
+        pass
+    return attachments
+
+
 def parse_email(raw_email: RawEmail) -> EmailData:
     """将原始 RFC822 字节解析为领域数据 :class:`EmailData`。
 
@@ -255,6 +340,9 @@ def parse_email(raw_email: RawEmail) -> EmailData:
 
     text_body, html_body = _extract_bodies(emsg)
 
+    # 附件收集：不再丢弃，分类后随领域数据返回（字节仅内存传递）
+    attachments = _extract_attachments(emsg)
+
     # 组装领域数据返回
     return EmailData(
         account_id=account_id,
@@ -266,4 +354,5 @@ def parse_email(raw_email: RawEmail) -> EmailData:
         sent_at=sent_at,
         text_body=text_body,
         html_body=html_body,
+        attachments=attachments,
     )

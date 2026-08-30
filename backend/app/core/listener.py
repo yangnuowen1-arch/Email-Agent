@@ -8,8 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import structlog
 
-from app.db.db import Account, EmailMessage
-from app.db.repositories import EmailAccountRepository, EmailRepository
+from app.db.db import Account, EmailAttachment, EmailMessage
+from app.db.repositories import EmailAccountRepository, EmailAttachmentRepository, EmailRepository
 from app.schemas import AccountSpec, EmailData
 from app.services.email import EmailService
 
@@ -57,10 +57,13 @@ class EmailListener:
     生命周期由容器统一接管：``run`` 阻塞直到停止，``stop`` 幂等可重复调用。
     """
 
-    def __init__(self, database, email_service: EmailService, config, logger=None) -> None:
+    def __init__(
+        self, database, email_service: EmailService, config, attachment_storage=None, logger=None
+    ) -> None:
         self._database = database
         self._email = email_service
         self._config = config
+        self._storage = attachment_storage
         self._logger = logger or structlog.get_logger("email-agent.listener")
 
         # 运行期状态：账号 stop_event、监听任务与专用线程池，仅在 run 期间有效
@@ -143,19 +146,71 @@ class EmailListener:
                 error=str(exc),
             )
 
+    async def _upload_attachments(self, message: EmailData) -> list[dict]:
+        """单封邮件附件上传 COS（网络 IO，DB 事务外执行），返回附件元数据行。
+
+        未配置存储或单附件上传失败时降级为纯元数据（storage_* 为 NULL），
+        不阻塞收信主流程。
+        """
+        rows: list[dict] = []
+        for index, attachment in enumerate(message.attachments):
+            row: dict = {
+                "kind": attachment.kind,
+                "filename": attachment.filename,
+                "content_type": attachment.content_type,
+                "disposition": attachment.disposition,
+                "content_id": attachment.content_id,
+                "size": attachment.size,
+                "storage_url": None,
+                "storage_key": None,
+            }
+            if attachment.content is not None and self._storage is not None:
+                key = self._storage.build_key(
+                    message.account_id, message.uid, index, attachment.filename
+                )
+                try:
+                    row["storage_url"] = await self._storage.upload(
+                        key,
+                        attachment.content,
+                        attachment.content_type or "application/octet-stream",
+                    )
+                    row["storage_key"] = key
+                except Exception as exc:  # noqa: BLE001
+                    self._logger.warning(
+                        "attachment_upload_failed",
+                        account_id=message.account_id,
+                        uid=message.uid,
+                        filename=attachment.filename,
+                        error=str(exc),
+                    )
+            rows.append(row)
+        return rows
+
     def _make_store_callback(self, spec: AccountSpec):
-        """构造单账号落库回调：邮件入库 + 断点推进在单账号事务内原子完成。"""
+        """构造单账号落库回调：附件上传 COS，邮件入库 + 附件元数据 + 断点推进单事务原子完成。"""
 
         async def _store(messages: list[EmailData]) -> None:
             if not messages:
                 return
 
             start = time.monotonic()
-            # 单账号事务：邮件入库 + 断点推进随一次提交原子生效
+            # 1) 附件先上传 COS（事务外网络 IO；未配置存储或失败 → 仅元数据）
+            uploaded = [(m, await self._upload_attachments(m)) for m in messages]
+
+            # 2) 单账号事务：邮件入库 + 附件元数据 + 断点推进随一次提交原子生效
             async with self._database.session() as session:
-                inserted = await EmailRepository(session).bulk_create_email(
-                    [_to_email_message(m) for m in messages]
+                id_map = await EmailRepository(session).bulk_create_email(
+                    [_to_email_message(m) for m, _ in uploaded]
                 )
+                entities = [
+                    EmailAttachment(email_id=email_id, **row)
+                    for m, rows in uploaded
+                    if (email_id := id_map.get((m.account_id, m.uid)))
+                    for row in rows
+                ]
+                if entities:
+                    await EmailAttachmentRepository(session).bulk_create_email_attachment(entities)
+
                 max_uid = max(message.uid for message in messages)
                 if max_uid > spec.last_sync_uid:
                     await EmailAccountRepository(session).update_account_checkpoint(
@@ -167,8 +222,9 @@ class EmailListener:
                 account_id=spec.account_id,
                 account_name=spec.name,
                 received=len(messages),
-                inserted=inserted,
-                skipped=len(messages) - inserted,
+                inserted=len(id_map),
+                attachments=len(entities),
+                skipped=len(messages) - len(id_map),
                 max_uid=max_uid,
                 duration_ms=int((time.monotonic() - start) * 1000),
             )

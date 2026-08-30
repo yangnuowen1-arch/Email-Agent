@@ -1,7 +1,8 @@
 """邮件智能体编排器：集中管理清洗、DB 读写与意向分析图。
 
 唯一的 langgraph 是 ``build_email_analysis_graph``（从清洗后的文本进入 LLM 意向分析）。
-本类负责从数据库读取邮件、清洗正文、装配并驱动该图，以及批量分析入口。
+本类负责从数据库读取邮件与附件、清洗正文、装配并驱动该图，以及批量分析入口；
+附件字节从 COS 拉取、提取缓存写回均在本类完成（分析图自身不触 IO）。
 """
 
 from __future__ import annotations
@@ -14,9 +15,9 @@ from app.agent.trace_handle import GraphTraceHandler
 from app.core.settings import AppConfig
 from app.db.db import EmailAnalysis, EmailMessage
 from app.db.engine import Database
-from app.db.repositories import EmailAnalysisRepository, EmailRepository
+from app.db.repositories import EmailAnalysisRepository, EmailAttachmentRepository, EmailRepository
 from app.llm import build_chat_model
-from app.schemas.analysis import UNKNOWN_INTENT
+from app.schemas.analysis import EVIDENCE_BODY, UNKNOWN_INTENT
 from app.services.preprocess import preprocess_email_text
 
 
@@ -26,13 +27,70 @@ class EmailCoordinator:
         config: AppConfig,
         database: Database,
         logger,
+        attachment_storage=None,
     ):
         self._config = config
         self._database = database
         self._logger = logger
+        self._storage = attachment_storage
 
         self._chat_model = build_chat_model(self._config.llm)
-        self._analysis_graph = build_email_analysis_graph(self._chat_model)
+        # 视觉模型（识别图片附件用）；未配置则跳过图片识别
+        self._vision_model = (
+            build_chat_model(self._config.llm, model=self._config.llm.llm_vision_model)
+            if self._config.llm.llm_vision_model
+            else None
+        )
+        self._analysis_graph = build_email_analysis_graph(self._chat_model, self._vision_model)
+
+    async def _load_attachment_input(self, email_id: int) -> list[dict]:
+        """读取附件元数据并按需从 COS 拉取字节，组装分析图的附件输入。
+
+        已有提取缓存（extracted_text）的直接复用，不重复拉取；
+        COS 未配置或拉取失败时跳过该附件（分析基于剩余内容继续）。
+        """
+        async with self._database.session() as session:
+            repo = EmailAttachmentRepository(session)
+            attachments = await repo.list_email_attachment_by_email_id(email_id)
+
+        attachment_input: list[dict] = []
+        for att in attachments:
+            if att.kind not in ("email", "image"):
+                continue
+            item: dict = {
+                "attachment_id": att.id,
+                "kind": att.kind,
+                "filename": att.filename,
+                "content_type": att.content_type,
+                "content": None,
+                "extracted_text": att.extracted_text,
+            }
+            if item["extracted_text"] is None and att.storage_key and self._storage is not None:
+                try:
+                    item["content"] = await self._storage.fetch(att.storage_key)
+                except Exception as exc:  # noqa: BLE001
+                    self._logger.warning(
+                        "attachment_fetch_failed",
+                        email_id=email_id,
+                        attachment_id=att.id,
+                        storage_key=att.storage_key,
+                        error=str(exc),
+                    )
+                    continue
+            if item["content"] or item["extracted_text"]:
+                attachment_input.append(item)
+        return attachment_input
+
+    async def _save_extracted_cache(self, cache: list[dict]) -> None:
+        """把 analyze 节点的附件提取结果写回 email_attachments.extracted_text 缓存。"""
+        if not cache:
+            return
+        async with self._database.session() as session:
+            repo = EmailAttachmentRepository(session)
+            for item in cache:
+                await repo.update_email_attachment_extracted_text_by_id(
+                    item["attachment_id"], item["extracted_text"]
+                )
 
     async def analyze_email(self, email_id: int) -> dict:
 
@@ -49,7 +107,10 @@ class EmailCoordinator:
             email.html_body,
         )
 
-        # 3. 构建初始状态并驱动分析图，结束后一次性记录完整调用链
+        # 3. 附件输入：元数据 + COS 拉取的字节 / 已有提取缓存
+        attachment_input = await self._load_attachment_input(email.id)
+
+        # 4. 构建初始状态并驱动分析图，结束后一次性记录完整调用链
         initial = {
             "email_id": email.id,
             "account_id": email.account_id,
@@ -57,6 +118,7 @@ class EmailCoordinator:
             "sender": email.sender,
             "sent_at": email.sent_at,
             "cleaned_text": cleaned_text,
+            "attachments": attachment_input,
         }
 
         trace = GraphTraceHandler()
@@ -81,7 +143,10 @@ class EmailCoordinator:
                 )
                 result, error_info = {}, exc
 
-            # 4. 落库分析结果（成功或失败兜底）
+            # 5. 提取缓存写回（失败路径无部分状态，跳过即可）
+            await self._save_extracted_cache(result.get("extracted_cache") or [])
+
+            # 6. 落库分析结果（成功或失败兜底）
             async with self._database.session() as session:
                 repo = EmailAnalysisRepository(session)
                 entity = EmailAnalysis(
@@ -100,6 +165,7 @@ class EmailCoordinator:
                     source_language=result.get("source_language"),
                     translated_subject=result.get("translated_subject"),
                     translated_text=result.get("translated_text"),
+                    intent_evidence_source=result.get("intent_evidence_source", EVIDENCE_BODY),
                 )
 
                 if error_info is not None:
@@ -116,6 +182,7 @@ class EmailCoordinator:
                 "status": "failed" if error_info is not None else "analyzed",
                 "primary_intent": result.get("primary_intent", UNKNOWN_INTENT),
                 "priority": result.get("priority", "P2"),
+                "intent_evidence_source": result.get("intent_evidence_source", EVIDENCE_BODY),
                 "error": str(error_info) if error_info is not None else None,
                 "error_type": type(error_info).__name__ if error_info is not None else None,
             }

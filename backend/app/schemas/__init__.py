@@ -4,6 +4,7 @@ from app.schemas.account import AccountConfig
 from app.schemas.email import (
     AccountSpec,
     EmailData,
+    ParsedAttachment,
     ParsedEmail,
     RawEmail,
 )
@@ -11,6 +12,7 @@ from app.schemas.email import (
 __all__ = [
     "AccountConfig",
     "ParsedEmail",
+    "ParsedAttachment",
     "AccountSpec",
     "EmailData",
     "RawEmail",

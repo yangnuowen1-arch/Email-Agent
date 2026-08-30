@@ -41,9 +41,20 @@ EMAIL_ANALYSIS_SYSTEM_PROMPT = (
     "- P3: 通知类/低优先级\n\n"
     "## 情绪判定\n\n"
     "从正文推断：positive / neutral / negative / angry / urgent\n\n"
+    "## 意图证据归属规则\n\n"
+    "输入视图可能分层：--- 正文 ---（收件人手写壳层文字）、"
+    "--- 转发邮件 ---（.eml 附件解析内容）、--- 图片内容 ---（图片视觉识别结果）。\n"
+    '1. 壳层正文有明确请求（如"请帮我退货"）→ 意图以壳层为准；'
+    "转发邮件与图片仅用于补充实体（订单号、金额等）与上下文。\n"
+    '2. 壳层正文为空或仅"见附件"类极短指引 → 意图取自附件内容：'
+    "转发邮件看最内层最新一封需要处理的邮件；图片看内容本身"
+    "（如发票照片 → invoice_query，订单截图 → order_status_query）。\n"
+    "3. 各层内容冲突时优先级：壳层正文 > 转发邮件最新层 > 图片。\n"
+    "4. intent_evidence_source 如实标注主意图证据来自哪一层；reasoning 说明依据来源。\n"
+    "5. 壳层为空且图片是营销海报/通知模板 → spam_or_notice。\n\n"
     "## 附加约束\n\n"
     "1. intents 至少包含 1 条，confidence 基于证据，不得虚高。\n"
-    "2. entities 只抽取正文出现过的值，禁止编造。\n"
+    "2. entities 只抽取正文或附件提取内容中出现过的值，禁止编造。\n"
     "3. suggested_tools 从可用工具列表中选择（请参阅函数定义）。\n"
     f"4. primary_intent 必须输出，无法判定时使用 '{UNKNOWN_INTENT}'。"
 )

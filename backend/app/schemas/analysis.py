@@ -88,6 +88,27 @@ PRIORITY_LITERAL = Literal["P0", "P1", "P2", "P3"]
 #: 排除在翻译之外的意图：垃圾/系统通知/广告无阅读价值，翻译纯属浪费调用
 TRANSLATION_EXCLUDED_INTENTS: frozenset[str] = frozenset({INTENT_SPAM_OR_NOTICE})
 
+# ---------------------------------------------------------------------------
+# 意图证据来源（分层视图判定，与 docs/db-schema.md 1:1）
+# ---------------------------------------------------------------------------
+
+#: 证据来源：壳层正文 / .eml 转发邮件 / 图片识别 / 多层混合
+EVIDENCE_BODY = "body"
+EVIDENCE_ATTACHED_EMAIL = "attached_email"
+EVIDENCE_IMAGE = "image"
+EVIDENCE_MIXED = "mixed"
+
+#: 全部证据来源
+EVIDENCE_SOURCES: tuple[str, ...] = (
+    EVIDENCE_BODY,
+    EVIDENCE_ATTACHED_EMAIL,
+    EVIDENCE_IMAGE,
+    EVIDENCE_MIXED,
+)
+
+#: 意图证据来源 Literal（LLM 输出白名单）
+EVIDENCE_SOURCE_LITERAL = Literal["body", "attached_email", "image", "mixed"]
+
 
 class IntentDetail(BaseModel):
     """单条意图详情。"""
@@ -111,6 +132,13 @@ class EmailAnalysisOutput(BaseModel):
     sentiment: SENTIMENT_LITERAL = Field(default="neutral", description="发件人情绪")
     priority: PRIORITY_LITERAL = Field(default="P2", description="处理优先级")
     suggested_tools: list[str] = Field(default_factory=list, description="建议调用的 Tool 名列表")
+    intent_evidence_source: EVIDENCE_SOURCE_LITERAL = Field(
+        default=EVIDENCE_BODY,
+        description=(
+            "主意图的证据来源：body=壳层正文；attached_email=.eml 转发邮件附件；"
+            "image=图片识别；mixed=多层综合"
+        ),
+    )
 
 
 class EmailTranslationOutput(BaseModel):

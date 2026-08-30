@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -160,9 +161,9 @@ class TestEmailRepository:
         mock_session.flush.assert_awaited_once()
         assert saved is msg
 
-    async def test_bulk_create_email_empty_returns_zero(self):
+    async def test_bulk_create_email_empty_returns_empty_map(self):
         repo = EmailRepository(self._mock_session())
-        assert await repo.bulk_create_email([]) == 0
+        assert await repo.bulk_create_email([]) == {}
 
     async def test_bulk_create_email_rejects_non_model(self):
         repo = EmailRepository(self._mock_session())
@@ -178,10 +179,14 @@ class TestEmailRepository:
         mock_session.execute.assert_awaited_once()
 
     async def test_bulk_builds_pg_insert_statement(self):
-        """验证 bulk_create_email 组装 PG 方言的 ON CONFLICT DO NOTHING 语句。"""
+        """验证 bulk_create_email 组装 PG 方言的 ON CONFLICT DO NOTHING 语句并返回映射。"""
         mock_session = self._mock_session()
+        rows = [
+            SimpleNamespace(account_id=1, uid=1, id=101),
+            SimpleNamespace(account_id=1, uid=2, id=102),
+        ]
         mock_session.execute = AsyncMock(
-            return_value=MagicMock(fetchall=MagicMock(return_value=[1, 2]))
+            return_value=MagicMock(fetchall=MagicMock(return_value=rows))
         )
 
         repo = EmailRepository(mock_session)
@@ -189,9 +194,9 @@ class TestEmailRepository:
             EmailMessage(account_id=1, uid=1, subject="a"),
             EmailMessage(account_id=1, uid=2, subject="b"),
         ]
-        count = await repo.bulk_create_email(msgs)
+        id_map = await repo.bulk_create_email(msgs)
 
-        assert count == 2
+        assert id_map == {(1, 1): 101, (1, 2): 102}
         mock_session.execute.assert_awaited_once()
         stmt = mock_session.execute.call_args.args[0]
         compiled = stmt.compile(dialect=sqlalchemy.dialects.postgresql.dialect())

@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas import ParsedEmail
 
-from .db import Account, EmailAnalysis, EmailMessage
+from .db import Account, EmailAnalysis, EmailAttachment, EmailMessage
 
 
 class EmailAccountRepository:
@@ -235,10 +235,14 @@ class EmailRepository:
         await self.session.flush()
         return message
 
-    async def bulk_create_email(self, messages: list[EmailMessage]) -> int:
-        """批量插入邮件，利用 (account_id, uid) 幂等去重，返回实际插入行数。"""
+    async def bulk_create_email(self, messages: list[EmailMessage]) -> dict[tuple[int, int], int]:
+        """批量插入邮件，利用 (account_id, uid) 幂等去重。
+
+        返回 {(account_id, uid): 新插入的 email_id} 映射；冲突未插入的邮件
+        不在映射中，调用方据此跳过其关联数据（如附件），保证幂等。
+        """
         if not messages:
-            return 0
+            return {}
 
         values: list[dict] = []
         for m in messages:
@@ -266,14 +270,75 @@ class EmailRepository:
             pg_insert(EmailMessage)
             .values(values)
             .on_conflict_do_nothing(index_elements=["account_id", "uid"])
-            .returning(EmailMessage.id)
+            .returning(EmailMessage.account_id, EmailMessage.uid, EmailMessage.id)
         )
         result = await self.session.execute(stmt)
-        return len(result.fetchall())
+        return {(row.account_id, row.uid): row.id for row in result.fetchall()}
 
     async def delete_email_by_id(self, email_id: int) -> bool:
         """按主键删除邮件，返回是否删除成功。"""
         stmt = delete(EmailMessage).where(EmailMessage.id == email_id)
+        result = await self.session.execute(stmt)
+        return bool(result.rowcount)
+
+
+# ---------------------------------------------------------------------------
+# 邮件附件 Repository
+# ---------------------------------------------------------------------------
+
+
+class EmailAttachmentRepository:
+    """email_attachments 表的异步访问入口。"""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def bulk_create_email_attachment(self, entities: list[EmailAttachment]) -> int:
+        """批量插入附件元数据，返回插入条数（附件引用由调用方保证幂等）。"""
+        if not entities:
+            return 0
+
+        values: list[dict] = []
+        for e in entities:
+            if not isinstance(e, EmailAttachment):
+                msg = f"expected EmailAttachment, got {type(e).__name__}"
+                raise TypeError(msg)
+            values.append(
+                {
+                    "email_id": e.email_id,
+                    "kind": e.kind,
+                    "filename": e.filename,
+                    "content_type": e.content_type,
+                    "disposition": e.disposition,
+                    "content_id": e.content_id,
+                    "size": e.size,
+                    "storage_url": e.storage_url,
+                    "storage_key": e.storage_key,
+                }
+            )
+
+        await self.session.execute(pg_insert(EmailAttachment).values(values))
+        return len(values)
+
+    async def list_email_attachment_by_email_id(self, email_id: int) -> list[EmailAttachment]:
+        """按所属邮件查询附件列表，按插入顺序返回。"""
+        stmt = (
+            select(EmailAttachment)
+            .where(EmailAttachment.email_id == email_id)
+            .order_by(EmailAttachment.id)
+        )
+        result = await self.session.scalars(stmt)
+        return list(result.all())
+
+    async def update_email_attachment_extracted_text_by_id(
+        self, attachment_id: int, extracted_text: str
+    ) -> bool:
+        """写回附件内容提取缓存（.eml 解析文本 / 图片识别文本）。"""
+        stmt = (
+            update(EmailAttachment)
+            .where(EmailAttachment.id == attachment_id)
+            .values(extracted_text=extracted_text, extracted_at=datetime.now(UTC))
+        )
         result = await self.session.execute(stmt)
         return bool(result.rowcount)
 
@@ -332,6 +397,7 @@ class EmailAnalysisRepository:
                 source_language=entity.source_language,
                 translated_subject=entity.translated_subject,
                 translated_text=entity.translated_text,
+                intent_evidence_source=entity.intent_evidence_source,
             )
             .on_conflict_do_update(
                 index_elements=["email_id"],
@@ -350,6 +416,7 @@ class EmailAnalysisRepository:
                     "source_language": entity.source_language,
                     "translated_subject": entity.translated_subject,
                     "translated_text": entity.translated_text,
+                    "intent_evidence_source": entity.intent_evidence_source,
                     "updated_at": now,
                 },
             )

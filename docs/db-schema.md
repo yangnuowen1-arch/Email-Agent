@@ -10,15 +10,17 @@ email_accounts (1) ──────< (N) emails
  账号配置(输入)            已拉取邮件(输出)
      └── last_sync_uid ──────┘  ← 断点续传的桥梁
                                 │
-                                ▼
-                          email_analyses
-                          结构化分析(输出)
-                          ← email_id 唯一
+                ┌───────────────┼───────────────┐
+                ▼                               ▼
+        email_attachments                email_analyses
+        附件元数据+COS引用(输出)          结构化分析(输出)
+        ← 按 email_id 关联               ← email_id 唯一
 ```
 
 - 一条 `email_accounts` 记录对应一个真实邮箱，是程序的唯一输入源。
 - `emails.account_id` 外键关联到账号，`(account_id, uid)` 唯一约束保证同一邮箱内邮件不重复入库。
 - `email_analyses.email_id` 唯一约束保证一封邮件至多一份分析结果，支撑 `ON CONFLICT (email_id) DO UPDATE` 幂等重跑。
+- `email_attachments.email_id` 逻辑外键关联到邮件，一行 = 一个附件的元数据 + COS 对象引用；**附件字节不上库**，存腾讯云 COS，DB 只存 `storage_url` / `storage_key`。
 
 ## 2. 表结构
 
@@ -155,6 +157,7 @@ CREATE TABLE email_analyses (
     source_language   TEXT,
     translated_subject TEXT,
     translated_text   TEXT,
+    intent_evidence_source TEXT NOT NULL DEFAULT 'body',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -176,6 +179,7 @@ COMMENT ON COLUMN email_analyses.model IS '产出该分析的模型名（如 gpt
 COMMENT ON COLUMN email_analyses.source_language IS '检测到的源语言 ISO 639-1 代码（detect_and_translate 节点产出，如 en/ja/zh/unknown），中文启发式短路或垃圾邮件跳过翻译时为空';
 COMMENT ON COLUMN email_analyses.translated_subject IS '主题中文译文，仅非中文业务邮件非空（detect_and_translate 节点产出）';
 COMMENT ON COLUMN email_analyses.translated_text IS '正文中文译文，仅非中文业务邮件非空（detect_and_translate 节点产出）';
+COMMENT ON COLUMN email_analyses.intent_evidence_source IS '主意图的证据来源：body（壳层正文）/ attached_email（.eml 转发邮件附件）/ image（图片视觉识别）/ mixed（多层综合）';
 COMMENT ON COLUMN email_analyses.created_at IS '首次分析时间';
 COMMENT ON COLUMN email_analyses.updated_at IS '最后更新时间，ON CONFLICT DO UPDATE 时刷新';
 
@@ -202,12 +206,68 @@ COMMENT ON COLUMN email_analyses.updated_at IS '最后更新时间，ON CONFLICT
 | source_language | TEXT | 可空 | 检测到的源语言 ISO 639-1 代码（en/ja/zh/unknown），未翻译为空 |
 | translated_subject | TEXT | 可空 | 主题中文译文，仅非中文业务邮件非空 |
 | translated_text | TEXT | 可空 | 正文中文译文，仅非中文业务邮件非空 |
+| intent_evidence_source | TEXT | NOT NULL, DEFAULT 'body' | 主意图的证据来源：body（壳层正文）/ attached_email（.eml 转发邮件附件）/ image（图片视觉识别）/ mixed（多层综合） |
 | created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 首次分析时间 |
 | updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 最后更新时间，ON CONFLICT DO UPDATE 时刷新 |
 
 写入方式：`INSERT ... ON CONFLICT (email_id) DO UPDATE`，支持重跑幂等。
 
-### 2.4 意图分类表（intent categories）
+### 2.4 email_attachments — 邮件附件表（输出）
+
+```sql
+CREATE TABLE email_attachments (
+    id             SERIAL PRIMARY KEY,
+    email_id       INT  NOT NULL,
+    kind           TEXT NOT NULL DEFAULT 'document',
+    filename       TEXT NOT NULL DEFAULT '',
+    content_type   TEXT NOT NULL DEFAULT '',
+    disposition    TEXT,
+    content_id     TEXT,
+    size           INT  NOT NULL DEFAULT 0,
+    storage_url    TEXT,
+    storage_key    TEXT,
+    extracted_text TEXT,
+    extracted_at   TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_email_attachments_email_id ON email_attachments(email_id);
+
+COMMENT ON TABLE email_attachments IS '邮件附件表：元数据 + 腾讯云 COS 对象引用，附件字节不上库';
+COMMENT ON COLUMN email_attachments.id IS '自增主键';
+COMMENT ON COLUMN email_attachments.email_id IS '所属邮件 ID，逻辑外键 → emails.id（无物理外键约束）';
+COMMENT ON COLUMN email_attachments.kind IS '附件类别：image（图片，含内嵌 cid 图）/ email（.eml / message/rfc822）/ document（其他）';
+COMMENT ON COLUMN email_attachments.filename IS '附件文件名，可能缺失';
+COMMENT ON COLUMN email_attachments.content_type IS 'MIME 内容类型，如 image/png、message/rfc822';
+COMMENT ON COLUMN email_attachments.disposition IS 'Content-Disposition：inline / attachment，可能缺失';
+COMMENT ON COLUMN email_attachments.content_id IS '内嵌资源 Content-ID（去尖括号），仅 inline 图片等场景非空';
+COMMENT ON COLUMN email_attachments.size IS '附件大小（字节），以解析时实际读取为准';
+COMMENT ON COLUMN email_attachments.storage_url IS 'COS 对象访问 URL；仅存元数据（未上传）时为 NULL';
+COMMENT ON COLUMN email_attachments.storage_key IS 'COS 对象键，SDK 拉取与清理按 key 操作';
+COMMENT ON COLUMN email_attachments.extracted_text IS '内容提取缓存：.eml 解析文本 / 图片识别文本；未提取为 NULL';
+COMMENT ON COLUMN email_attachments.extracted_at IS '最近一次提取时间';
+COMMENT ON COLUMN email_attachments.created_at IS '入库时间（UTC），插入后不可变';
+```
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | SERIAL | PK | 自增主键 |
+| email_id | INT | NOT NULL，逻辑外键 → emails.id | 所属邮件 |
+| kind | TEXT | NOT NULL, DEFAULT 'document' | 附件类别：image / email / document |
+| filename | TEXT | NOT NULL, DEFAULT '' | 附件文件名，可能缺失 |
+| content_type | TEXT | NOT NULL, DEFAULT '' | MIME 内容类型 |
+| disposition | TEXT | 可空 | Content-Disposition：inline / attachment |
+| content_id | TEXT | 可空 | 内嵌资源 Content-ID（去尖括号） |
+| size | INT | NOT NULL, DEFAULT 0 | 附件大小（字节） |
+| storage_url | TEXT | 可空 | COS 对象访问 URL；未上传为 NULL |
+| storage_key | TEXT | 可空 | COS 对象键，SDK 拉取/清理用 |
+| extracted_text | TEXT | 可空 | 内容提取缓存（.eml 解析文本 / 图片识别文本），未提取为 NULL |
+| extracted_at | TIMESTAMPTZ | 可空 | 最近一次提取时间 |
+| created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 入库时间（UTC） |
+
+写入方式：抓取时 `INSERT`（附件先上传 COS 再写元数据，同账号事务内与邮件插入原子提交）；
+分析时成功提取后 `UPDATE extracted_text / extracted_at`（缓存，重复分析不重复拉取与调用）。
+
+### 2.5 意图分类表（intent categories）
 
 > 英文标识是代码中的枚举值（`app/schemas/analysis.py` 的 `ALL_INTENTS`，单一来源），
 > LLM 输出必须从本表选择；白名单外值校验失败 → 分析走 fallback（status=failed）。
@@ -329,3 +389,36 @@ COMMENT ON COLUMN email_analyses.translated_text IS '正文中文译文，仅非
 ```
 
 中文邮件（启发式短路）、垃圾/通知邮件、分析失败路径三列均为 NULL；DDL 与字段注释见 §2.3。
+
+### 2026-08-30 附件接入：新增 email_attachments 表 + email_analyses 新增证据来源列
+
+附件字节不再丢弃/不落库：抓取时上传腾讯云 COS，DB 仅存对象引用。
+
+```sql
+CREATE TABLE email_attachments (
+    id             SERIAL PRIMARY KEY,
+    email_id       INT  NOT NULL,
+    kind           TEXT NOT NULL DEFAULT 'document',
+    filename       TEXT NOT NULL DEFAULT '',
+    content_type   TEXT NOT NULL DEFAULT '',
+    disposition    TEXT,
+    content_id     TEXT,
+    size           INT  NOT NULL DEFAULT 0,
+    storage_url    TEXT,
+    storage_key    TEXT,
+    extracted_text TEXT,
+    extracted_at   TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_email_attachments_email_id ON email_attachments(email_id);
+
+ALTER TABLE email_analyses
+    ADD COLUMN intent_evidence_source TEXT NOT NULL DEFAULT 'body';
+COMMENT ON COLUMN email_analyses.intent_evidence_source IS '主意图的证据来源：body（壳层正文）/ attached_email（.eml 转发邮件附件）/ image（图片视觉识别）/ mixed（多层综合）';
+```
+
+- `email_attachments`：一行 = 一个附件的元数据 + COS 引用（`storage_url`/`storage_key`）；
+  `extracted_text` 为分析阶段内容提取缓存（.eml 解析文本 / 图片识别文本）。
+- `intent_evidence_source`：意图分析新增"证据来源"输出，支撑分层视图判定
+  （壳层正文 / 转发邮件 / 图片 / 混合），规则见分析图 system prompt。
+- DDL 与字段注释见 §2.3 / §2.4。

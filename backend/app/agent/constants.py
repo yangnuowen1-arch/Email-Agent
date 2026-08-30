@@ -24,3 +24,12 @@ LLM_CALL_TIMEOUT_SECONDS: int = 120
 ANALYSIS_MAX_BODY_CHARS: int = 6000
 #: 节点级 RetryPolicy 最大尝试次数（含首次）
 LLM_NODE_MAX_ATTEMPTS: int = 2
+
+# ---------------------------------------------------------------------------
+# 附件参与分析（_analyze_node 内附件内容提取）
+# ---------------------------------------------------------------------------
+
+#: 壳层正文低于该长度视为"极短"，才对图片附件做视觉识别（成本控制）
+SHORT_SHELL_CHARS: int = 200
+#: 单封邮件最多识别的图片附件数
+MAX_IMAGES_PER_EMAIL: int = 3

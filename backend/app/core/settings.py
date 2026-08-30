@@ -25,6 +25,25 @@ class LLMConfig(BaseSettings):
     llm_max_tokens: int = 4096
     llm_timeout_seconds: int = 320
 
+    # 视觉模型名（识别图片附件用，OpenAI 兼容网关）；未配置则跳过图片识别
+    llm_vision_model: str | None = None
+
+
+class CosConfig(BaseSettings):
+    """腾讯云 COS 对象存储配置，由环境变量/.env 驱动。
+
+    未配置（缺任一项）时附件链路降级：仅落元数据，不上传、不提取内容。
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    cos_secret_id: str | None = None
+    cos_secret_key: str | None = None
+    # 桶名，如 email-agent-1250000000
+    cos_bucket: str | None = None
+    # 地域，如 ap-guangzhou
+    cos_region: str | None = None
+
 
 def _parse_int(name: str, raw: str | None, default: int) -> int:
     """解析环境变量中的整数字符串，带默认值和友好报错。"""
@@ -64,6 +83,8 @@ class AppConfig:
     log_level: str = "INFO"
     # 内嵌 LLM 运行时配置；缺省按环境变量实例化一份
     llm: LLMConfig = field(default_factory=LLMConfig)
+    # 腾讯云 COS 配置；附件字节上 COS，DB 只存对象引用
+    cos: CosConfig = field(default_factory=CosConfig)
 
     def __post_init__(self) -> None:
         """初始化后校验：确保所有配置项都在合法范围内。"""

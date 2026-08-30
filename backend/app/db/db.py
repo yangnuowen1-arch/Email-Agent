@@ -22,7 +22,14 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 
-from app.schemas.analysis import ALL_INTENTS, PRIORITIES, SENTIMENTS, UNKNOWN_INTENT
+from app.schemas.analysis import (
+    ALL_INTENTS,
+    EVIDENCE_BODY,
+    EVIDENCE_SOURCES,
+    PRIORITIES,
+    SENTIMENTS,
+    UNKNOWN_INTENT,
+)
 
 
 class Base(DeclarativeBase):
@@ -274,6 +281,98 @@ class EmailMessage(Base):
 
 
 # ---------------------------------------------------------------------------
+# 邮件附件模型
+# ---------------------------------------------------------------------------
+
+_VALID_EVIDENCE_SOURCES = set(EVIDENCE_SOURCES)
+
+
+class EmailAttachment(Base):
+    """邮件附件 ORM 模型，对应数据库 email_attachments 表的一行。
+
+    附件字节不上库：抓取时上传腾讯云 COS，本表只保留元数据与对象引用
+    （storage_url / storage_key），extracted_text 缓存附件内容提取结果。
+    """
+
+    __tablename__ = "email_attachments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 所属邮件 ID，与 emails.id 对应
+    email_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # 附件类别：image（含内嵌 cid 图）/ email（.eml）/ document
+    kind: Mapped[str] = mapped_column(String, default="document")
+    # 附件文件名，可能缺失
+    filename: Mapped[str] = mapped_column(String, default="")
+    # MIME 内容类型
+    content_type: Mapped[str] = mapped_column(String, default="")
+    # Content-Disposition：inline / attachment，可能缺失
+    disposition: Mapped[str | None] = mapped_column(String)
+    # 内嵌资源 Content-ID（去尖括号），仅 inline 图片等场景非空
+    content_id: Mapped[str | None] = mapped_column(String)
+    # 附件大小（字节），以解析时实际读取为准
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    # COS 对象访问 URL；仅存元数据（未上传）时为 NULL
+    storage_url: Mapped[str | None] = mapped_column(String)
+    # COS 对象键，SDK 拉取与清理按 key 操作
+    storage_key: Mapped[str | None] = mapped_column(String)
+    # 内容提取缓存：.eml 解析文本 / 图片识别文本；未提取为 NULL
+    extracted_text: Mapped[str | None] = mapped_column(Text)
+    # 最近一次提取时间
+    extracted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 入库时间
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc, nullable=False
+    )
+
+    def __init__(
+        self,
+        *,
+        id: int | None = None,
+        email_id: int,
+        kind: str = "document",
+        filename: str = "",
+        content_type: str = "",
+        disposition: str | None = None,
+        content_id: str | None = None,
+        size: int = 0,
+        storage_url: str | None = None,
+        storage_key: str | None = None,
+        extracted_text: str | None = None,
+        extracted_at: datetime | None = None,
+    ) -> None:
+        """构造后校验：确保核心字段类型正确。"""
+        if not isinstance(email_id, int) or email_id <= 0:
+            msg = f"email_id must be positive int, got {email_id!r}"
+            raise ValueError(msg)
+        if kind not in ("image", "email", "document"):
+            msg = f"kind must be one of ['email', 'image', 'document'], got {kind!r}"
+            raise ValueError(msg)
+        if not isinstance(size, int) or size < 0:
+            msg = f"size must be int >=0, got {size!r}"
+            raise ValueError(msg)
+
+        self.id = id  # type: ignore[assignment]
+        self.email_id = email_id
+        self.kind = kind
+        self.filename = filename
+        self.content_type = content_type
+        self.disposition = disposition
+        self.content_id = content_id
+        self.size = size
+        self.storage_url = storage_url
+        self.storage_key = storage_key
+        self.extracted_text = extracted_text
+        self.extracted_at = extracted_at
+
+    @validates("email_id")
+    def _validate_email_id(self, key: str, value: int) -> int:
+        if not isinstance(value, int) or value <= 0:
+            msg = f"email_id must be positive int, got {value!r}"
+            raise ValueError(msg)
+        return value
+
+
+# ---------------------------------------------------------------------------
 # 邮件结构化分析模型
 # ---------------------------------------------------------------------------
 
@@ -323,6 +422,8 @@ class EmailAnalysis(Base):
     translated_subject: Mapped[str | None] = mapped_column(Text)
     # 正文中文译文，仅非中文业务邮件非空
     translated_text: Mapped[str | None] = mapped_column(Text)
+    # 主意图证据来源：body（壳层正文）/ attached_email（.eml 附件）/ image（图片）/ mixed
+    intent_evidence_source: Mapped[str] = mapped_column(String, default=EVIDENCE_BODY)
     # 首次分析时间
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now_utc, nullable=False
@@ -351,6 +452,7 @@ class EmailAnalysis(Base):
         source_language: str | None = None,
         translated_subject: str | None = None,
         translated_text: str | None = None,
+        intent_evidence_source: str = EVIDENCE_BODY,
     ) -> None:
         """构造后校验：确保白名单字段值合法，必填字段非空。"""
         if not isinstance(email_id, int) or email_id <= 0:
@@ -374,6 +476,12 @@ class EmailAnalysis(Base):
         if status == "failed" and not error:
             msg = "status='failed' requires non-empty error"
             raise ValueError(msg)
+        if intent_evidence_source not in _VALID_EVIDENCE_SOURCES:
+            msg = (
+                f"intent_evidence_source must be one of {sorted(_VALID_EVIDENCE_SOURCES)}, "
+                f"got {intent_evidence_source!r}"
+            )
+            raise ValueError(msg)
 
         self.id = id  # type: ignore[assignment]
         self.email_id = email_id
@@ -391,3 +499,4 @@ class EmailAnalysis(Base):
         self.source_language = source_language
         self.translated_subject = translated_subject
         self.translated_text = translated_text
+        self.intent_evidence_source = intent_evidence_source

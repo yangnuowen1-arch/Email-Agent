@@ -60,11 +60,30 @@ class RawEmail:
 
 
 @dataclass(frozen=True, kw_only=True)
+class ParsedAttachment:
+    """一个已解析的邮件附件，parser 的产出。
+
+    ``kind`` 取值：image（图片，含内嵌 cid 图）/ email（.eml / message/rfc822）/
+    document（其他）。``content`` 为附件原始字节，仅在内存中传递、不落库；
+    超过大小上限或解析失败时为 None（只保留元数据）。
+    """
+
+    filename: str = ""
+    content_type: str = ""
+    disposition: str | None = None
+    content_id: str | None = None
+    size: int = 0
+    content: bytes | None = None
+    kind: str = "document"
+
+
+@dataclass(frozen=True, kw_only=True)
 class EmailData:
     """一封已解析的领域邮件，parser 的产出、repository 的入参。
 
     字段与 ``emails`` 表当前列一一对应；``fetched_at`` 缺省为 None，
     由落库层（ORM ``EmailMessage``）在写入时按当前 UTC 时间填充。
+    附件字节不落库，由落库层上传对象存储后仅保留引用（见 EmailAttachment）。
     """
 
     account_id: int
@@ -78,3 +97,4 @@ class EmailData:
     html_body: str | None = None
     is_read: bool = False
     fetched_at: datetime | None = None
+    attachments: list[ParsedAttachment] = field(default_factory=list)

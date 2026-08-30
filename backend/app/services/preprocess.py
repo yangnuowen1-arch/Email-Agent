@@ -119,15 +119,28 @@ def compose_email_view(
     sender: str | None,
     sent_at: datetime | None,
     cleaned_text: str,
+    attachment_views: list[dict] | None = None,
 ) -> str:
-    """将邮件元数据与清洗后正文拼成 LLM 消费的格式化文本。"""
-    sent_at_str = sent_at.isoformat() if sent_at else "未知"
-    body_section = cleaned_text if cleaned_text else "(正文为空)"
+    """将邮件元数据、正文与附件提取内容拼成 LLM 消费的分层视图。
 
-    return (
-        f"发件人: {sender or '未知'}\n"
-        f"主题: {subject or '(无主题)'}\n"
-        f"时间: {sent_at_str}\n"
-        f"--- 正文 ---\n"
-        f"{body_section}"
-    )
+    ``attachment_views`` 每项: {"kind": "email"|"image", "filename": str, "text": str}；
+    分别输出"转发邮件"/"图片内容"分层段并标注来源。不传参数时输出与
+    旧版（仅元数据 + 正文）完全一致，保证向后兼容。
+    """
+    sent_at_str = sent_at.isoformat() if sent_at else "未知"
+    parts = [
+        f"发件人: {sender or '未知'}",
+        f"主题: {subject or '(无主题)'}",
+        f"时间: {sent_at_str}",
+        "--- 正文 ---",
+        cleaned_text if cleaned_text else "(正文为空)",
+    ]
+    for view in attachment_views or []:
+        if view.get("kind") == "email":
+            label = f"--- 转发邮件（附件：{view.get('filename') or '未命名.eml'}）---"
+        else:
+            label = f"--- 图片内容（附件：{view.get('filename') or '未命名图片'}，视觉识别）---"
+        text = (view.get("text") or "").strip()
+        parts.append(label)
+        parts.append(text if text else "(未能识别)")
+    return "\n".join(parts)

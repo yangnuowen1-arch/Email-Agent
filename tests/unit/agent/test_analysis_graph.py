@@ -453,3 +453,229 @@ async def test_contextvars_flow_into_handler_logs(monkeypatch) -> None:
     # FakeChatModel 非 langchain Runnable，不触发 LLM 级回调；chain 事件由 langgraph 发出
     starts = [e for e in captured if e.get("event") == "graph_chain_start"]
     assert starts and starts[0]["email_id"] == 7
+
+
+# ---------------------------------------------------------------------------
+# 附件参与分析测试（分层视图 / 缓存复用 / 视觉降级）
+# ---------------------------------------------------------------------------
+
+
+class FakeVisionModel:
+    """记录调用的假视觉模型；calls 为收到的消息列表，行为可注入。"""
+
+    def __init__(self, *, reply: str = "发票照片", error: Exception | None = None):
+        self._reply = reply
+        self._error = error
+        self.calls: list[list] = []
+
+    async def ainvoke(self, messages, **kwargs):
+        self.calls.append(messages)
+        if self._error is not None:
+            raise self._error
+        from types import SimpleNamespace
+
+        return SimpleNamespace(content=self._reply)
+
+
+def _eml_bytes(subject: str, body: str) -> bytes:
+    return (
+        b"From: Old <old@example.com>\r\n"
+        b"Subject: " + subject.encode() + b"\r\n"
+        b"\r\n" + body.encode() + b"\r\n"
+    )
+
+
+def _eml_attachment_state(**overrides: Any) -> EmailAnalysisState:
+    attachment = {
+        "attachment_id": 9,
+        "kind": "email",
+        "filename": "forwarded.eml",
+        "content_type": "message/rfc822",
+        "content": _eml_bytes("Old thread", "old body text"),
+        "extracted_text": None,
+    }
+    return _base_state(**{"attachments": [attachment], **overrides})
+
+
+async def test_analyze_node_eml_attachment_composes_layered_view() -> None:
+    """.eml 附件被解析进分层视图，提取结果进入待写回缓存。"""
+    model = FakeChatModel(output=_analysis_success_output())
+
+    result = await _analyze_node(_eml_attachment_state(), chat_model=model)
+
+    assert len(result["attachment_views"]) == 1
+    view = result["attachment_views"][0]
+    assert view["kind"] == "email"
+    assert view["filename"] == "forwarded.eml"
+    assert "Old thread" in view["text"]
+    assert "old body text" in view["text"]
+    assert result["extracted_cache"] == [{"attachment_id": 9, "extracted_text": view["text"]}]
+    # LLM 收到的 HumanMessage 含转发邮件分层段
+    human = model.calls[0][1][1].content
+    assert "--- 转发邮件（附件：forwarded.eml）---" in human
+
+
+async def test_analyze_node_cached_extracted_text_reused_without_content() -> None:
+    """已有提取缓存：不携带字节也直接进视图（重复分析不重复拉取/调用）。"""
+    attachment = {
+        "attachment_id": 7,
+        "kind": "image",
+        "filename": "cached.png",
+        "content_type": "image/png",
+        "content": None,
+        "extracted_text": "上次识别的发票内容",
+    }
+    model = FakeChatModel(output=_analysis_success_output())
+    vision = FakeVisionModel()
+
+    result = await _analyze_node(
+        _base_state(cleaned_text="见附件", attachments=[attachment]),
+        chat_model=model,
+        vision_model=vision,
+    )
+
+    assert result["attachment_views"][0]["text"] == "上次识别的发票内容"
+    assert result["extracted_cache"][0]["attachment_id"] == 7
+    assert vision.calls == []
+
+
+async def test_analyze_node_image_short_shell_calls_vision() -> None:
+    """壳层极短（见附件）+ 图片附件 → 调视觉识别进视图。"""
+    attachment = {
+        "attachment_id": 5,
+        "kind": "image",
+        "filename": "invoice.png",
+        "content_type": "image/png",
+        "content": b"png-bytes",
+        "extracted_text": None,
+    }
+    model = FakeChatModel(output=_analysis_success_output())
+    vision = FakeVisionModel(reply="发票照片，金额 128.00")
+
+    result = await _analyze_node(
+        _base_state(cleaned_text="见附件", attachments=[attachment]),
+        chat_model=model,
+        vision_model=vision,
+    )
+
+    assert len(vision.calls) == 1
+    assert result["attachment_views"][0]["text"] == "发票照片，金额 128.00"
+    assert "--- 图片内容（附件：invoice.png，视觉识别）---" in model.calls[0][1][1].content
+
+
+async def test_analyze_node_image_rich_shell_skips_vision() -> None:
+    """壳层正文足够长 → 不做视觉识别（成本控制），无图片视图。"""
+    attachment = {
+        "attachment_id": 5,
+        "kind": "image",
+        "filename": "invoice.png",
+        "content_type": "image/png",
+        "content": b"png-bytes",
+        "extracted_text": None,
+    }
+    model = FakeChatModel(output=_analysis_success_output())
+    vision = FakeVisionModel()
+
+    result = await _analyze_node(
+        _base_state(cleaned_text="请帮我处理这个订单" * 30, attachments=[attachment]),
+        chat_model=model,
+        vision_model=vision,
+    )
+
+    assert vision.calls == []
+    assert result["attachment_views"] == []
+    assert result["extracted_cache"] == []
+
+
+async def test_analyze_node_image_budget_capped() -> None:
+    """每封邮件最多识别 3 张图片，超出部分跳过。"""
+    attachments = [
+        {
+            "attachment_id": i,
+            "kind": "image",
+            "filename": f"img{i}.png",
+            "content_type": "image/png",
+            "content": b"png",
+            "extracted_text": None,
+        }
+        for i in range(5)
+    ]
+    model = FakeChatModel(output=_analysis_success_output())
+    vision = FakeVisionModel()
+
+    result = await _analyze_node(
+        _base_state(cleaned_text="见附件", attachments=attachments),
+        chat_model=model,
+        vision_model=vision,
+    )
+
+    assert len(vision.calls) == 3
+    assert len(result["attachment_views"]) == 3
+
+
+async def test_analyze_node_vision_failure_degrades() -> None:
+    """视觉模型调用失败 → 图片段降级跳过，分析正常完成。"""
+    attachment = {
+        "attachment_id": 5,
+        "kind": "image",
+        "filename": "invoice.png",
+        "content_type": "image/png",
+        "content": b"png-bytes",
+        "extracted_text": None,
+    }
+    model = FakeChatModel(output=_analysis_success_output())
+    vision = FakeVisionModel(error=RuntimeError("vision down"))
+
+    result = await _analyze_node(
+        _base_state(cleaned_text="见附件", attachments=[attachment]),
+        chat_model=model,
+        vision_model=vision,
+    )
+
+    assert result["attachment_views"] == []
+    assert result["extracted_cache"] == []
+    assert result["primary_intent"] == "cancel_order"
+
+
+async def test_detect_and_translate_uses_attachment_text_for_language_check() -> None:
+    """中文壳层 + 英文转发邮件 → 不误判 zh 短路，进 LLM 翻译。"""
+    model = FakeChatModel(output=_translation_success_output())
+    state = _eml_attachment_state(
+        subject="请处理",
+        cleaned_text="见附件",
+    )
+    # 覆盖附件内容为英文转发邮件
+    state["attachments"] = [
+        {
+            "attachment_id": 9,
+            "kind": "email",
+            "filename": "forwarded.eml",
+            "content_type": "message/rfc822",
+            "content": _eml_bytes("Please cancel order ORD-123", "I want a refund"),
+            "extracted_text": None,
+        }
+    ]
+    # 预置 analyze 产出的分层视图（翻译节点从 state 读取）
+    state["attachment_views"] = [
+        {
+            "kind": "email",
+            "filename": "forwarded.eml",
+            "text": "Subject: Please cancel order ORD-123",
+        }
+    ]
+
+    result = await _detect_language_and_translate_node(state, chat_model=model)
+
+    assert result["source_language"] == "en"
+    assert model.calls[0][0] == "EmailTranslationOutput"
+
+
+async def test_build_graph_accepts_vision_model() -> None:
+    """build_email_analysis_graph 支持 vision_model 注入，图正常执行。"""
+    model = FakeChatModel(outcomes=[_analysis_success_output(), _translation_success_output()])
+    graph = build_email_analysis_graph(model, vision_model=FakeVisionModel())
+
+    result = await graph.ainvoke(_eml_attachment_state())
+
+    assert result["primary_intent"] == "cancel_order"
+    assert result["attachment_views"]

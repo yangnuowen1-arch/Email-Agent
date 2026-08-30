@@ -110,3 +110,19 @@ def test_invalid_email_id_raises() -> None:
 def test_invalid_account_id_raises() -> None:
     with pytest.raises(ValueError, match="account_id must be positive"):
         EmailAnalysis(email_id=1, account_id=-1)
+
+
+def test_intent_evidence_source_defaults_to_body() -> None:
+    entity = EmailAnalysis(email_id=1, account_id=1)
+    assert entity.intent_evidence_source == "body"
+
+
+@pytest.mark.parametrize("source", ["body", "attached_email", "image", "mixed"])
+def test_valid_intent_evidence_sources(source: str) -> None:
+    entity = EmailAnalysis(email_id=1, account_id=1, intent_evidence_source=source)
+    assert entity.intent_evidence_source == source
+
+
+def test_invalid_intent_evidence_source_raises() -> None:
+    with pytest.raises(ValueError, match="intent_evidence_source must be one of"):
+        EmailAnalysis(email_id=1, account_id=1, intent_evidence_source="screenshot")
