@@ -10,11 +10,11 @@ email_accounts (1) ──────< (N) emails
  账号配置(输入)            已拉取邮件(输出)
      └── last_sync_uid ──────┘  ← 断点续传的桥梁
                                 │
-                ┌───────────────┼───────────────┐
-                ▼                               ▼
-        email_attachments                email_analyses
-        附件元数据+COS引用(输出)          结构化分析(输出)
-        ← 按 email_id 关联               ← email_id 唯一
+                ┌───────────────┼───────────────┬───────────────┐
+                ▼               ▼                               ▼
+        email_attachments  email_analyses                 email_drafts
+        附件元数据+COS引用   结构化分析(输出)                回复草稿(输出)
+        ← 按 email_id 关联  ← email_id 唯一                ← email_id 唯一
 
 kb_documents (1) ──────< (N) kb_chunks
      │                        │
@@ -26,7 +26,8 @@ kb_documents (1) ──────< (N) kb_chunks
 - `emails.account_id` 外键关联到账号，`(account_id, uid)` 唯一约束保证同一邮箱内邮件不重复入库。
 - `email_analyses.email_id` 唯一约束保证一封邮件至多一份分析结果，支撑 `ON CONFLICT (email_id) DO UPDATE` 幂等重跑。
 - `email_attachments.email_id` 逻辑外键关联到邮件，一行 = 一个附件的元数据 + COS 对象引用；**附件字节不上库**，存腾讯云 COS，DB 只存 `storage_url` / `storage_key`。
-- `kb_documents`/`kb_chunks` 是 RAG 知识库（回复草稿的知识支撑），与邮件链路**零接线**：文档级管幂等重入库与归档，块级管向量检索；`kb_type` 从文档冗余到块，类型过滤不需要 join。
+- `email_drafts.email_id` 唯一约束保证一封邮件至多一版草稿，重生成即整体覆盖（status 重置回 pending）；**草稿只落库待人工确认，本系统不发送邮件**。
+- `kb_documents`/`kb_chunks` 是 RAG 知识库（回复草稿的知识支撑）：文档级管幂等重入库与归档，块级管向量检索；`kb_type` 从文档冗余到块，类型过滤不需要 join。草稿分支（售前查 faq、售后查 sop）经 `KnowledgeRetriever` 消费，`email_drafts.sources` 记录命中依据。
 
 ## 2. 表结构
 
@@ -287,6 +288,8 @@ COMMENT ON COLUMN email_attachments.created_at IS '入库时间（UTC），插�
 | invoice_query | 发票/账单查询 | ToC（消费者） |
 | meeting_request | 会议/日程请求 | ToC（消费者） |
 | complaint | 投诉/不满表达 | ToC（消费者） |
+| pre_sales_consult | 售前咨询：产品信息/材质/价格/优惠券活动/库存/发货时效等购买前问题 | ToC（消费者） |
+| after_sales_consult | 售后咨询：退换货政策/保修维护/使用方法等售后问题 | ToC（消费者） |
 | spam_or_notice | 垃圾邮件/系统通知/广告 | ToC（消费者） |
 | other | 无法归类的消费者意图 | ToC（消费者） |
 | contract | 合同/协议相关 | ToB（企业） |
@@ -384,7 +387,7 @@ COMMENT ON COLUMN kb_chunks.created_at IS '入库时间（UTC），插入后不�
 | created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 入库时间（UTC），插入后不可变 |
 
 写入方式：重入库时**整篇换块**——先 `DELETE WHERE document_id = :id` 再批量插入新块，同一事务内完成。
-检索方式：`SELECT ... WHERE kb_type = :t AND embedding_model = :m ORDER BY embedding <=> :query LIMIT :k`（余弦距离，仅 active 文档的块参与）。实现：`app/rag/retriever.py` 的 `KnowledgeRetriever`（查询文本先经 embedding 模型向量化，再走 `KbChunkRepository.list_kb_chunk_by_similarity`）。
+检索方式：`SELECT ... WHERE kb_type = :t AND embedding_model = :m ORDER BY embedding <=> :query LIMIT :k`（余弦距离，仅 active 文档的块参与）。实现：`app/rag/retriever.py` 的 `KnowledgeRetriever`（查询文本先经 embedding 模型向量化，再走 `KbChunkRepository.list_kb_chunk_by_similarity`，检索行 join `kb_documents` 带出文档标题，供草稿上下文标注知识出处）。
 向量索引（ivfflat/hnsw）待 M2 embedding 模型与维度定型后再加——M2 已落地 rag 管线（`app/rag/`）与 `LLM_EMBEDDING_MODEL` 配置，真实模型定型后仍单独加索引。
 
 ### 2.8 知识类型表（kb types）
@@ -400,6 +403,56 @@ COMMENT ON COLUMN kb_chunks.created_at IS '入库时间（UTC），插入后不�
 | compliance | 合规与红线规则 | 不可承诺事项（未批准折扣/未审阅法务条款）、转人工触发词 → 划定安全边界，草稿不越线 |
 
 `kb_documents.kb_type` 与 `kb_chunks.kb_type` 均取本表枚举值；来源形态 `source_type` 白名单（mail / file / text）同样定义在 `app/schemas/knowledge.py`。
+
+### 2.9 email_drafts — 回复草稿表（输出，人工确认流）
+
+```sql
+CREATE TABLE email_drafts (
+    id         SERIAL PRIMARY KEY,
+    email_id   INT  NOT NULL UNIQUE,
+    account_id INT  NOT NULL,
+    category   TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'pending',
+    subject    TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    sources    JSONB NOT NULL DEFAULT '[]',
+    model      TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_email_drafts_account_id ON email_drafts(account_id);
+
+COMMENT ON TABLE email_drafts IS '回复草稿表（输出）：待人工确认，本系统不发送邮件';
+COMMENT ON COLUMN email_drafts.id IS '自增主键';
+COMMENT ON COLUMN email_drafts.email_id IS '草稿归属邮件 ID，逻辑外键 → emails.id（无物理外键约束）；UNIQUE 保证一封邮件一版草稿，重生成即整体覆盖';
+COMMENT ON COLUMN email_drafts.account_id IS '冗余所属账号，便于按账号查询草稿';
+COMMENT ON COLUMN email_drafts.category IS '草稿类别：presale（售前咨询，检索 faq 知识）/ aftersale（售后问题，检索 sop 知识）';
+COMMENT ON COLUMN email_drafts.status IS '确认状态：pending（待人工确认）/ approved（人工确认可用）/ rejected（人工否决）；重生成后重置回 pending';
+COMMENT ON COLUMN email_drafts.subject IS '回复主题（草稿节点产出，原主题前加 Re: 前缀）';
+COMMENT ON COLUMN email_drafts.body IS '回复正文（草稿节点产出，使用客户来信语言，仅基于知识库摘录与礼貌话术）';
+COMMENT ON COLUMN email_drafts.sources IS '检索依据，JSONB 数组：[{"document_id":1,"title":"...","distance":0.32,"snippet":"..."}]，人工核对草稿事实用';
+COMMENT ON COLUMN email_drafts.model IS '生成草稿的模型名';
+COMMENT ON COLUMN email_drafts.created_at IS '首次生成时间（UTC）';
+COMMENT ON COLUMN email_drafts.updated_at IS '最后更新时间（UTC），重生成/状态变更时刷新';
+```
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | SERIAL | PK | 自增主键 |
+| email_id | INT | NOT NULL, UNIQUE | 草稿归属邮件，唯一约束支撑 `ON CONFLICT (email_id) DO UPDATE` 幂等重生成 |
+| account_id | INT | NOT NULL, INDEX | 冗余所属账号 |
+| category | TEXT | NOT NULL | presale（售前）/ aftersale（售后），白名单 `app/schemas/draft.py` |
+| status | TEXT | NOT NULL, DEFAULT 'pending' | pending / approved / rejected（人工确认流） |
+| subject | TEXT | NOT NULL | 回复主题 |
+| body | TEXT | NOT NULL | 回复正文 |
+| sources | JSONB | NOT NULL, DEFAULT '[]' | 检索依据 `[{document_id, title, distance, snippet}]` |
+| model | TEXT | | 生成草稿的模型名 |
+| created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 首次生成时间（UTC） |
+| updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 最后更新时间（UTC） |
+
+写入方式：分析图草稿分支（`draft_presale` / `draft_aftersale` 节点）产出 subject/body 与检索依据，由 `EmailCoordinator._save_draft` 经 `EmailDraftRepository.upsert_email_draft` 落库——`ON CONFLICT (email_id) DO UPDATE` 整体覆盖且 `status` 重置回 pending。
+质量门槛：知识库检索无命中或最近余弦距离超过 `DRAFT_MAX_COSINE_DISTANCE`（代码常量，与 embedding 模型相关）时**不出草稿**（`draft_skipped_reason="no_relevant_knowledge"`），邮件留在分析结果层转人工——低置信不硬答。
+确认流：`draft_list` / `draft_review` CLI 仅读写本表状态，**发送邮件在系统之外由人工完成**。
 
 ## 3. 设计说明
 
@@ -572,3 +625,52 @@ CREATE INDEX idx_kb_chunks_kb_type ON kb_chunks (kb_type);
 - 知识类型白名单（faq / sop / compliance）见 §2.8，代码单一来源 `app/schemas/knowledge.py`。
 - 可执行脚本：`scripts/kb_schema.sql`（建表）、`scripts/kb_seed.sql`（示例数据，占位向量 embedding_model='seed-dummy-1536'）。
 - 向量索引（ivfflat/hnsw）待 M2 embedding 维度定型后再加；ORM/仓储见 `app/db/db.py`（`KbDocument`/`KbChunk`）与 `app/db/repositories.py`。
+
+### 2026-08-30 分析图对接 RAG：新增 email_drafts 表 + 意图枚举扩充（售前/售后）
+
+分析图新增条件草稿分支：主意图命中售前/售后意图映射（单一来源 `app/schemas/draft.py` 的
+`DRAFT_CATEGORY_BY_INTENT`）且配置了 embedding 时，draft_presale / draft_aftersale 节点
+检索知识库（售前查 faq、售后查 sop）起草回复草稿，落 `email_drafts` 待人工确认；
+**本系统不发送邮件**。检索无相关知识时不出草稿（转人工）。
+
+```sql
+CREATE TABLE email_drafts (
+    id         SERIAL PRIMARY KEY,
+    email_id   INT  NOT NULL UNIQUE,
+    account_id INT  NOT NULL,
+    category   TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'pending',
+    subject    TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    sources    JSONB NOT NULL DEFAULT '[]',
+    model      TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_email_drafts_account_id ON email_drafts(account_id);
+
+COMMENT ON TABLE email_drafts IS '回复草稿表（输出）：待人工确认，本系统不发送邮件';
+COMMENT ON COLUMN email_drafts.category IS '草稿类别：presale（售前咨询，检索 faq 知识）/ aftersale（售后问题，检索 sop 知识）';
+COMMENT ON COLUMN email_drafts.status IS '确认状态：pending（待人工确认）/ approved（人工确认可用）/ rejected（人工否决）；重生成后重置回 pending';
+COMMENT ON COLUMN email_drafts.sources IS '检索依据，JSONB 数组：[{"document_id":1,"title":"...","distance":0.32,"snippet":"..."}]，人工核对草稿事实用';
+```
+
+- 意图枚举扩充（无表结构变更，`primary_intent` 白名单自动跟随）：ToC 新增
+  `pre_sales_consult`（售前咨询）、`after_sales_consult`（售后咨询），见 §2.5。
+- 草稿状态流转：pending →（人工）approved / rejected；重生成整体覆盖并重置 pending。
+- DDL 与字段注释见 §2.9；ORM/仓储见 `app/db/db.py`（`EmailDraft`）与
+  `app/db/repositories.py`（`EmailDraftRepository`）；确认入口 `draft_list` / `draft_review` CLI。
+
+### 2026-08-30 草稿链补全：合规红线全量注入 + 检索命中带文档标题（无表结构变更）
+
+- 合规红线（`kb_type=compliance`）接入草稿链：`EmailCoordinator._load_compliance_rules`
+  经 `KbChunkRepository.list_kb_chunk_by_kb_type`（非向量全量，仅 active 文档）读出红线块
+  文本，经初始 state `compliance_rules` 注入草稿 prompt（「红线规则」段，优先级最高，
+  总字符预算 `DRAFT_COMPLIANCE_MAX_CHARS`）；读取失败降级为空列表不拖垮分析主链。
+  新增仓储方法无 DDL 变更。
+- 检索命中带文档标题：`list_kb_chunk_by_similarity` 改为 join `kb_documents`，
+  返回行 `KbChunkSimilarityRow(chunk, document_title, distance)`；
+  `email_drafts.sources` 每项增加 `title` 键（`RetrievedChunk.document_title` 透传），
+  sources 记录形状更新为 `[{document_id, title, distance, snippet}]`（§2.9 注释同步）。
+- 可执行脚本：`scripts/draft_schema.sql`（email_drafts 建表，与 §2.9 严格 1:1）。
+  已按 §2.9 旧注释建表的库如需对齐注释可重跑 §2.9 的 COMMENT ON 语句（可选，无数据变更）。

@@ -228,6 +228,14 @@ class TestSimilarityStatement:
         assert "kb_documents.status = ?" in where_sql
         assert "kb_chunks.embedding_model = ?" in where_sql
 
+    def test_select_includes_document_title_via_join(self):
+        """检索行带出所属文档标题（草稿上下文标注知识出处），经 join 取得。"""
+        stmt = _build_similarity_stmt("faq", [0.1] * KB_EMBEDDING_DIMENSIONS, top_k=5)
+        sql = str(stmt.compile(dialect=sqlite.dialect()))
+
+        assert "kb_documents.title" in sql
+        assert "JOIN kb_documents" in sql
+
     def test_order_by_cosine_distance_and_limit(self):
         stmt = _build_similarity_stmt("faq", [0.1] * KB_EMBEDDING_DIMENSIONS, top_k=5)
         order_sql = str(stmt._order_by_clauses[0].compile(dialect=sqlite.dialect()))
@@ -257,3 +265,73 @@ class TestSimilarityValidation:
         repo = KbChunkRepository(session)
         with pytest.raises(ValueError, match="query_embedding"):
             await repo.list_kb_chunk_by_similarity("faq", [0.1] * 768)
+
+
+# ---------------------------------------------------------------------------
+# list_kb_chunk_by_kb_type（非向量全量读取：红线规则等"恒在场"知识注入用）
+# ---------------------------------------------------------------------------
+
+
+class TestListKbChunkByKbType:
+    async def test_returns_active_chunks_ordered_by_document_and_index(self, session):
+        docs = KbDocumentRepository(session)
+        repo = KbChunkRepository(session)
+        doc_a = await docs.create_kb_document(_make_doc(source_key="file:a.md"))
+        doc_b = await docs.create_kb_document(_make_doc(source_key="file:b.md"))
+
+        # 乱序插入：读取应按 (document_id, chunk_index) 稳定排序
+        await repo.bulk_create_kb_chunk(
+            [
+                _make_chunk(doc_b.id, kb_type="compliance", chunk_index=0, content="b0"),
+                _make_chunk(doc_a.id, kb_type="compliance", chunk_index=1, content="a1"),
+                _make_chunk(doc_a.id, kb_type="compliance", chunk_index=0, content="a0"),
+            ]
+        )
+
+        chunks = await repo.list_kb_chunk_by_kb_type("compliance")
+
+        assert [c.content for c in chunks] == ["a0", "a1", "b0"]
+
+    async def test_active_only_excludes_archived_documents(self, session):
+        docs = KbDocumentRepository(session)
+        repo = KbChunkRepository(session)
+        active = await docs.create_kb_document(_make_doc(source_key="file:a.md"))
+        archived = await docs.create_kb_document(
+            _make_doc(source_key="file:b.md", status="archived")
+        )
+        await repo.bulk_create_kb_chunk(
+            [
+                _make_chunk(active.id, content="active chunk"),
+                _make_chunk(archived.id, content="archived chunk"),
+            ]
+        )
+
+        assert [c.content for c in await repo.list_kb_chunk_by_kb_type("faq")] == ["active chunk"]
+        # active_only=False 全量返回（审计场景）
+        assert {
+            c.content for c in await repo.list_kb_chunk_by_kb_type("faq", active_only=False)
+        } == {"active chunk", "archived chunk"}
+
+    async def test_other_kb_type_chunks_not_leaked(self, session):
+        docs = KbDocumentRepository(session)
+        repo = KbChunkRepository(session)
+        doc = await docs.create_kb_document(_make_doc())
+        await repo.bulk_create_kb_chunk(
+            [
+                _make_chunk(doc.id, kb_type="faq", content="faq 内容"),
+                _make_chunk(doc.id, kb_type="compliance", chunk_index=1, content="红线内容"),
+            ]
+        )
+
+        chunks = await repo.list_kb_chunk_by_kb_type("compliance")
+
+        assert [c.content for c in chunks] == ["红线内容"]
+
+    async def test_rejects_invalid_kb_type(self, session):
+        repo = KbChunkRepository(session)
+        with pytest.raises(ValueError, match="kb_type"):
+            await repo.list_kb_chunk_by_kb_type("blog")
+
+    async def test_returns_empty_when_no_data(self, session):
+        repo = KbChunkRepository(session)
+        assert await repo.list_kb_chunk_by_kb_type("sop") == []

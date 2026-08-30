@@ -8,6 +8,7 @@ from app.core.email_coordinator import EmailCoordinator
 from app.core.listener import EmailListener
 from app.core.settings import AppConfig
 from app.db.engine import Database, build_database
+from app.llm.errors import LLMConfigurationError
 from app.observability import configure_logging
 from app.providers.email.base import AccountConfig, MailClient
 from app.providers.email.factory import create_client
@@ -43,6 +44,17 @@ class Container:
 
         self._email = EmailService(client_factory=self._make_client_factory())
 
+        # 知识库检索器（回复草稿分支用）：embedding 模型未配置时降级为 None，
+        # 分析图的草稿分支永不进入；CLI 检索场景经 knowledge_retriever 报配置错误
+        try:
+            self._knowledge_retriever: KnowledgeRetriever | None = KnowledgeRetriever(
+                embedder=build_knowledge_embedder(self._config.llm),
+                database=self._database,
+            )
+        except LLMConfigurationError as exc:
+            self._knowledge_retriever = None
+            self._logger.warning("knowledge_retriever_disabled", reason=str(exc))
+
         self._listener = EmailListener(
             database=self._database,
             email_service=self._email,
@@ -56,6 +68,7 @@ class Container:
             database=self._database,
             logger=self._logger,
             attachment_storage=self._storage,
+            knowledge_retriever=self._knowledge_retriever,
         )
 
     def _make_client_factory(self):
@@ -113,11 +126,15 @@ class Container:
 
     @property
     def knowledge_retriever(self) -> KnowledgeRetriever:
-        """构造知识库检索器（按需新建，不缓存），配置要求同 ``knowledge_ingestor``。"""
-        return KnowledgeRetriever(
-            embedder=build_knowledge_embedder(self._config.llm),
-            database=self._database,
-        )
+        """返回容器持有的知识库检索器（草稿分支与 CLI 检索共用同一实例）。
+
+        embedding 模型未配置时容器降级为 None（草稿分支静默关闭），但 CLI
+        检索场景需要明确的配置报错，因此此处抛 LLMConfigurationError。
+        """
+        if self._knowledge_retriever is None:
+            msg = "LLM_EMBEDDING_MODEL is required for knowledge retrieval"
+            raise LLMConfigurationError(msg)
+        return self._knowledge_retriever
 
     @property
     def logger(self):

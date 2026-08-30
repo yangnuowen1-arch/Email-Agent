@@ -32,6 +32,11 @@ from app.schemas.analysis import (
     SENTIMENTS,
     UNKNOWN_INTENT,
 )
+from app.schemas.draft import (
+    ALL_DRAFT_CATEGORIES,
+    ALL_DRAFT_STATUSES,
+    DRAFT_STATUS_PENDING,
+)
 from app.schemas.knowledge import (
     ALL_KB_SOURCE_TYPES,
     ALL_KB_STATUSES,
@@ -510,6 +515,95 @@ class EmailAnalysis(Base):
         self.translated_subject = translated_subject
         self.translated_text = translated_text
         self.intent_evidence_source = intent_evidence_source
+
+
+# ---------------------------------------------------------------------------
+# 回复草稿模型（人工确认流：本系统不发送邮件，确认动作仅改状态）
+# ---------------------------------------------------------------------------
+
+_VALID_DRAFT_CATEGORIES = set(ALL_DRAFT_CATEGORIES)
+_VALID_DRAFT_STATUSES = set(ALL_DRAFT_STATUSES)
+
+
+class EmailDraft(Base):
+    """回复草稿 ORM 模型，对应数据库 email_drafts 表的一行。
+
+    一封邮件至多一版草稿（email_id UNIQUE），重生成即整体覆盖且 status 重置
+    回 pending。subject/body 由草稿节点产出，sources 记录检索依据供人工核对。
+    """
+
+    __tablename__ = "email_drafts"
+    __table_args__ = (UniqueConstraint("email_id", name="email_drafts_email_id_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 草稿归属邮件 ID，唯一约束支撑 ON CONFLICT DO UPDATE 幂等重生成
+    email_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 冗余所属账号，便于按账号查询草稿
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # 草稿类别：presale（售前咨询）/ aftersale（售后问题）
+    category: Mapped[str] = mapped_column(String, nullable=False)
+    # 确认状态：pending（待人工确认）/ approved（确认可用）/ rejected（否决）
+    status: Mapped[str] = mapped_column(String, default=DRAFT_STATUS_PENDING)
+    # 回复主题（草稿节点产出）
+    subject: Mapped[str] = mapped_column(String, nullable=False)
+    # 回复正文（草稿节点产出）
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    # 检索依据：[{"document_id", "title", "distance", "snippet"}]，人工核对草稿事实用；
+    # sqlite 单测经 with_variant 退化为 JSON 列（PG 上仍为 JSONB，与 KbChunk.meta 一致）
+    sources: Mapped[list] = mapped_column(JSONB().with_variant(JSON(), "sqlite"), default=list)
+    # 生成草稿的模型名
+    model: Mapped[str | None] = mapped_column(String)
+    # 首次生成时间
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc, nullable=False
+    )
+    # 最后更新时间，ON CONFLICT DO UPDATE / 状态变更时刷新
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc, onupdate=_now_utc, nullable=False
+    )
+
+    def __init__(
+        self,
+        *,
+        id: int | None = None,
+        email_id: int,
+        account_id: int,
+        category: str,
+        status: str = DRAFT_STATUS_PENDING,
+        subject: str,
+        body: str,
+        sources: list | None = None,
+        model: str | None = None,
+    ) -> None:
+        """构造后校验：白名单字段值合法，必填字段非空。"""
+        if not isinstance(email_id, int) or email_id <= 0:
+            msg = f"email_id must be positive int, got {email_id!r}"
+            raise ValueError(msg)
+        if not isinstance(account_id, int) or account_id <= 0:
+            msg = f"account_id must be positive int, got {account_id!r}"
+            raise ValueError(msg)
+        if category not in _VALID_DRAFT_CATEGORIES:
+            msg = f"category must be one of {sorted(_VALID_DRAFT_CATEGORIES)}, got {category!r}"
+            raise ValueError(msg)
+        if status not in _VALID_DRAFT_STATUSES:
+            msg = f"status must be one of {sorted(_VALID_DRAFT_STATUSES)}, got {status!r}"
+            raise ValueError(msg)
+        if not isinstance(subject, str) or not subject.strip():
+            msg = f"subject must be non-empty str, got {subject!r}"
+            raise ValueError(msg)
+        if not isinstance(body, str) or not body.strip():
+            msg = f"body must be non-empty str, got {body!r}"
+            raise ValueError(msg)
+
+        self.id = id  # type: ignore[assignment]
+        self.email_id = email_id
+        self.account_id = account_id
+        self.category = category
+        self.status = status
+        self.subject = subject
+        self.body = body
+        self.sources = sources if sources is not None else []
+        self.model = model
 
 
 # ---------------------------------------------------------------------------

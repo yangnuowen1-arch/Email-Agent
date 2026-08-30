@@ -1,8 +1,8 @@
 """检索器：自然语言查询 → 向量化 → 同模型余弦检索 active 知识块。
 
-SQL 细节（kb_type/active/embedding_model 过滤 + ``<=>`` 排序）收敛在
-``KbChunkRepository.list_kb_chunk_by_similarity``，本模块只负责把
-「查询文本」翻译成「向量」再交给仓储；M3 回复草稿图将经闭包注入
+SQL 细节（kb_type/active/embedding_model 过滤 + ``<=>`` 排序 + 文档标题
+join）收敛在 ``KbChunkRepository.list_kb_chunk_by_similarity``，本模块只负责
+把「查询文本」翻译成「向量」再交给仓储；邮件分析图的草稿分支经闭包注入
 本类，图的内部不碰数据库。
 """
 
@@ -19,19 +19,20 @@ from app.schemas.knowledge import ALL_KB_TYPES
 
 @dataclass(slots=True, frozen=True)
 class RetrievedChunk:
-    """单条检索命中：原始块 + 余弦距离（越小越相似）。"""
+    """单条检索命中：原始块 + 所属文档标题 + 余弦距离（越小越相似）。"""
 
     chunk: KbChunk
+    document_title: str
     distance: float
 
     @property
     def content(self) -> str:
-        """命中块的原文，M3 直接喂给草稿 LLM。"""
+        """命中块的原文，草稿节点直接喂给 LLM。"""
         return self.chunk.content
 
     @property
     def document_id(self) -> int:
-        """所属文档 ID，运维定位与 M3 扩展文档标题用。"""
+        """所属文档 ID，运维定位与知识出处核对用。"""
         return self.chunk.document_id
 
 
@@ -70,4 +71,9 @@ class KnowledgeRetriever:
                 top_k=effective_top_k,
                 embedding_model=self._embedder.model_name,
             )
-        return [RetrievedChunk(chunk=chunk, distance=distance) for chunk, distance in hits]
+        return [
+            RetrievedChunk(
+                chunk=row.chunk, document_title=row.document_title, distance=row.distance
+            )
+            for row in hits
+        ]

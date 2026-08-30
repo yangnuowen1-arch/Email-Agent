@@ -1,8 +1,9 @@
-"""单邮件意向分析图单元测试：analyze 节点 + 编译后图端到端 + 调用链追踪。"""
+"""单邮件意向分析图单元测试：analyze 节点 + 编译后图端到端 + 草稿分支 + 调用链追踪。"""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -17,12 +18,29 @@ from app.agent.analysis_graph import (
     EmailAnalysisState,
     _analyze_node,
     _detect_language_and_translate_node,
+    _draft_node,
+    _route_after_translation,
     _route_translation_by_primary_intent,
     build_email_analysis_graph,
 )
+from app.agent.constants import (
+    DRAFT_COMPLIANCE_MAX_CHARS,
+    DRAFT_MAX_COSINE_DISTANCE,
+    DRAFT_RETRIEVAL_TOP_K,
+)
 from app.agent.errors import LLMInvocationError
+from app.agent.prompts import DRAFT_AFTERSALE_SYSTEM_PROMPT
 from app.agent.trace_handle import GraphTraceHandler
-from app.schemas.analysis import EmailAnalysisOutput, EmailTranslationOutput, IntentDetail
+from app.schemas.analysis import (
+    INTENT_PRE_SALES_CONSULT,
+    INTENT_REFUND_REQUEST,
+    UNKNOWN_INTENT,
+    EmailAnalysisOutput,
+    EmailTranslationOutput,
+    IntentDetail,
+)
+from app.schemas.draft import DRAFT_CATEGORY_AFTER_SALE, EmailDraftOutput
+from app.schemas.knowledge import KB_TYPE_SOP
 
 # ---------------------------------------------------------------------------
 # FakeChatModel（鸭子类型，模拟 with_structured_output）
@@ -679,3 +697,393 @@ async def test_build_graph_accepts_vision_model() -> None:
 
     assert result["primary_intent"] == "cancel_order"
     assert result["attachment_views"]
+
+
+# ---------------------------------------------------------------------------
+# 草稿分支测试（draft_presale / draft_aftersale 共用 _draft_node）
+# ---------------------------------------------------------------------------
+
+
+class FakeRetriever:
+    """记录调用并按预设返回命中或抛错的鸭子类型检索器。"""
+
+    def __init__(self, *, chunks: list[Any] | None = None, error: Exception | None = None):
+        self._chunks = chunks if chunks is not None else []
+        self._error = error
+        self.calls: list[tuple[str, str, int | None]] = []
+
+    async def retrieve(self, kb_type: str, query: str, *, top_k: int | None = None):
+        self.calls.append((kb_type, query, top_k))
+        if self._error is not None:
+            raise self._error
+        return self._chunks
+
+
+def _hit(
+    document_id: int, distance: float, content: str, document_title: str = "售后政策手册"
+) -> Any:
+    """构造检索命中对象（鸭子类型，与 RetrievedChunk 同形）。"""
+    return SimpleNamespace(
+        document_id=document_id, document_title=document_title, distance=distance, content=content
+    )
+
+
+def _draft_output(
+    subject: str = "Re: 测试邮件", body: str = "您好，感谢来信，相关情况说明如下。"
+) -> EmailDraftOutput:
+    return EmailDraftOutput(subject=subject, body=body)
+
+
+async def test_draft_node_generates_draft_from_relevant_knowledge() -> None:
+    retriever = FakeRetriever(
+        chunks=[
+            _hit(11, 0.2, "退货政策：签收后 7 天内可无理由退货。", document_title="售后政策手册"),
+            _hit(12, 0.4, "运费说明：非质量问题退货运费由买家承担。", document_title="运费规则"),
+        ]
+    )
+    model = FakeChatModel(output=_draft_output())
+
+    result = await _draft_node(
+        _base_state(primary_intent=INTENT_REFUND_REQUEST),
+        chat_model=model,
+        retriever=retriever,
+        category=DRAFT_CATEGORY_AFTER_SALE,
+        system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+        kb_type=KB_TYPE_SOP,
+    )
+
+    assert result["draft_category"] == "aftersale"
+    assert result["draft_subject"] == "Re: 测试邮件"
+    assert result["draft_body"].startswith("您好")
+    assert result["draft_model"] == "fake-model"
+    assert result["draft_sources"] == [
+        {
+            "document_id": 11,
+            "title": "售后政策手册",
+            "distance": 0.2,
+            "snippet": "退货政策：签收后 7 天内可无理由退货。",
+        },
+        {
+            "document_id": 12,
+            "title": "运费规则",
+            "distance": 0.4,
+            "snippet": "运费说明：非质量问题退货运费由买家承担。",
+        },
+    ]
+    # 检索参数：售后查 sop，query 由主题+正文拼成，top_k 取常量
+    assert retriever.calls == [("sop", "测试邮件\n请帮我取消订单 ORD-123", DRAFT_RETRIEVAL_TOP_K)]
+    # 知识摘录段进入 prompt，标注 document_id / 文档标题 / 距离
+    human = model.calls[0][1][1].content
+    assert "## 知识库摘录" in human
+    assert "[document_id=11 title=售后政策手册 distance=0.2000]" in human
+    assert "退货政策" in human
+
+
+async def test_draft_node_distance_over_threshold_skips_llm() -> None:
+    """最近命中距离超阈值 → 视为无相关知识，不调 LLM。"""
+    retriever = FakeRetriever(chunks=[_hit(11, DRAFT_MAX_COSINE_DISTANCE + 0.1, "不太相关的内容")])
+    model = FakeChatModel(output=_draft_output())
+
+    result = await _draft_node(
+        _base_state(primary_intent=INTENT_REFUND_REQUEST),
+        chat_model=model,
+        retriever=retriever,
+        category=DRAFT_CATEGORY_AFTER_SALE,
+        system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+        kb_type=KB_TYPE_SOP,
+    )
+
+    assert result == {"draft_skipped_reason": "no_relevant_knowledge"}
+    assert model.calls == []
+
+
+async def test_draft_node_empty_retrieval_skips_llm() -> None:
+    retriever = FakeRetriever(chunks=[])
+    model = FakeChatModel(output=_draft_output())
+
+    result = await _draft_node(
+        _base_state(primary_intent=INTENT_REFUND_REQUEST),
+        chat_model=model,
+        retriever=retriever,
+        category=DRAFT_CATEGORY_AFTER_SALE,
+        system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+        kb_type=KB_TYPE_SOP,
+    )
+
+    assert result == {"draft_skipped_reason": "no_relevant_knowledge"}
+    assert model.calls == []
+    assert len(retriever.calls) == 1
+
+
+async def test_draft_node_retrieval_failure_degrades() -> None:
+    """检索异常（embedding 网关不可用等）→ 降级不出草稿，仅记 warning。"""
+    retriever = FakeRetriever(error=RuntimeError("embedding gateway down"))
+    model = FakeChatModel(output=_draft_output())
+
+    with capture_logs() as cap:
+        result = await _draft_node(
+            _base_state(primary_intent=INTENT_REFUND_REQUEST),
+            chat_model=model,
+            retriever=retriever,
+            category=DRAFT_CATEGORY_AFTER_SALE,
+            system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+            kb_type=KB_TYPE_SOP,
+        )
+
+    assert result == {"draft_skipped_reason": "retrieval_failed"}
+    assert model.calls == []
+    warn = next(e for e in cap if e["event"] == "draft_retrieval_failed")
+    assert warn["kb_type"] == "sop"
+    assert "RuntimeError" in warn["error"]
+
+
+async def test_draft_node_generation_failure_degrades() -> None:
+    """LLM 起草失败 → 降级为 generation_failed，异常不外抛。"""
+    retriever = FakeRetriever(chunks=[_hit(11, 0.2, "退货政策内容")])
+    model = FakeChatModel(error=RuntimeError("llm timeout"))
+
+    result = await _draft_node(
+        _base_state(primary_intent=INTENT_REFUND_REQUEST),
+        chat_model=model,
+        retriever=retriever,
+        category=DRAFT_CATEGORY_AFTER_SALE,
+        system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+        kb_type=KB_TYPE_SOP,
+    )
+
+    assert result == {"draft_skipped_reason": "generation_failed"}
+
+
+async def test_draft_node_none_output_degrades() -> None:
+    """LLM 返回 None → 降级为 generation_failed。"""
+    retriever = FakeRetriever(chunks=[_hit(11, 0.2, "退货政策内容")])
+    model = FakeChatModel(output=None)
+
+    result = await _draft_node(
+        _base_state(primary_intent=INTENT_REFUND_REQUEST),
+        chat_model=model,
+        retriever=retriever,
+        category=DRAFT_CATEGORY_AFTER_SALE,
+        system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+        kb_type=KB_TYPE_SOP,
+    )
+
+    assert result == {"draft_skipped_reason": "generation_failed"}
+
+
+async def test_draft_node_intent_category_mismatch_skips_retrieval() -> None:
+    """意图与节点类别不匹配（路由错配防御）→ 不检索不调 LLM。"""
+    retriever = FakeRetriever(chunks=[_hit(11, 0.1, "内容")])
+    model = FakeChatModel(output=_draft_output())
+    state = _base_state(primary_intent=INTENT_PRE_SALES_CONSULT)
+
+    result = await _draft_node(
+        state,
+        chat_model=model,
+        retriever=retriever,
+        category=DRAFT_CATEGORY_AFTER_SALE,
+        system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+        kb_type=KB_TYPE_SOP,
+    )
+
+    assert result == {"draft_skipped_reason": "intent_category_mismatch"}
+    assert retriever.calls == []
+    assert model.calls == []
+
+
+async def test_draft_node_empty_query_skips_retrieval() -> None:
+    retriever = FakeRetriever()
+    model = FakeChatModel(output=_draft_output())
+
+    result = await _draft_node(
+        _base_state(primary_intent=INTENT_REFUND_REQUEST, subject="", cleaned_text=""),
+        chat_model=model,
+        retriever=retriever,
+        category=DRAFT_CATEGORY_AFTER_SALE,
+        system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+        kb_type=KB_TYPE_SOP,
+    )
+
+    assert result == {"draft_skipped_reason": "empty_query"}
+    assert retriever.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 草稿路由测试（detect_and_translate 后的条件边）
+# ---------------------------------------------------------------------------
+
+
+def test_route_after_translation_requires_retriever() -> None:
+    """未注入检索器：即使意图命中草稿映射也直达 END。"""
+    state = {**_base_state(), "primary_intent": INTENT_REFUND_REQUEST}
+    assert _route_after_translation(state, has_retriever=False) == END
+
+
+def test_route_after_translation_presale_intent() -> None:
+    state = {**_base_state(), "primary_intent": INTENT_PRE_SALES_CONSULT}
+    assert _route_after_translation(state, has_retriever=True) == "draft_presale"
+
+
+def test_route_after_translation_aftersale_intent() -> None:
+    state = {**_base_state(), "primary_intent": INTENT_REFUND_REQUEST}
+    assert _route_after_translation(state, has_retriever=True) == "draft_aftersale"
+
+
+def test_route_after_translation_non_draft_intent_ends() -> None:
+    state = {**_base_state(), "primary_intent": UNKNOWN_INTENT}
+    assert _route_after_translation(state, has_retriever=True) == END
+
+
+# ---------------------------------------------------------------------------
+# 红线规则注入测试（coordinator 全量注入 → 草稿 prompt）
+# ---------------------------------------------------------------------------
+
+
+async def test_draft_node_injects_compliance_rules_before_knowledge() -> None:
+    """红线规则段拼在知识库摘录之前，逐条列出；有红线不影响正常起草。"""
+    retriever = FakeRetriever(chunks=[_hit(11, 0.2, "退货政策内容")])
+    model = FakeChatModel(output=_draft_output())
+    state = _base_state(
+        primary_intent=INTENT_REFUND_REQUEST,
+        compliance_rules=["不得承诺退款到账时间", "禁止承诺最低价"],
+    )
+
+    result = await _draft_node(
+        state,
+        chat_model=model,
+        retriever=retriever,
+        category=DRAFT_CATEGORY_AFTER_SALE,
+        system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+        kb_type=KB_TYPE_SOP,
+    )
+
+    human = model.calls[0][1][1].content
+    assert "## 红线规则（知识库，优先级最高）" in human
+    assert "- 不得承诺退款到账时间" in human
+    assert "- 禁止承诺最低价" in human
+    assert human.index("红线规则") < human.index("知识库摘录")
+    assert result["draft_subject"] == "Re: 测试邮件"
+
+
+async def test_draft_node_omits_compliance_section_when_absent() -> None:
+    """知识库无红线数据（或读失败降级为空）→ 段落整体省略。"""
+    retriever = FakeRetriever(chunks=[_hit(11, 0.2, "退货政策内容")])
+    model = FakeChatModel(output=_draft_output())
+
+    await _draft_node(
+        _base_state(primary_intent=INTENT_REFUND_REQUEST),
+        chat_model=model,
+        retriever=retriever,
+        category=DRAFT_CATEGORY_AFTER_SALE,
+        system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+        kb_type=KB_TYPE_SOP,
+    )
+
+    human = model.calls[0][1][1].content
+    assert "红线规则" not in human
+    assert "## 知识库摘录" in human
+
+
+async def test_draft_node_compliance_budget_drops_overflow_rules() -> None:
+    """红线总长超字符预算：以整条为单位舍弃其后全部，不产生截断的残缺规则。"""
+    fitting_rule = "甲" * (DRAFT_COMPLIANCE_MAX_CHARS - 10)  # 含 "- " 前缀仍在预算内
+    retriever = FakeRetriever(chunks=[_hit(11, 0.2, "退货政策内容")])
+    model = FakeChatModel(output=_draft_output())
+    state = _base_state(
+        primary_intent=INTENT_REFUND_REQUEST,
+        compliance_rules=[fitting_rule, "超预算被舍弃的第二条红线"],
+    )
+
+    await _draft_node(
+        state,
+        chat_model=model,
+        retriever=retriever,
+        category=DRAFT_CATEGORY_AFTER_SALE,
+        system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+        kb_type=KB_TYPE_SOP,
+    )
+
+    human = model.calls[0][1][1].content
+    assert fitting_rule in human
+    assert "超预算被舍弃的第二条红线" not in human
+
+
+# ---------------------------------------------------------------------------
+# 草稿分支端到端测试（编译后的图）
+# ---------------------------------------------------------------------------
+
+
+async def test_compiled_graph_chinese_email_reaches_draft_node() -> None:
+    """中文售后邮件：analyze（zh 短路翻译）→ 草稿节点检索 sop → 草稿入终态。"""
+    retriever = FakeRetriever(chunks=[_hit(11, 0.2, "退款政策：7 天无理由退货。")])
+    model = FakeChatModel(
+        outcomes=[
+            _analysis_success_output(),
+            _draft_output(subject="Re: 取消订单", body="您好，已为您提交取消申请。"),
+        ]
+    )
+    graph = build_email_analysis_graph(model, knowledge_retriever=retriever)
+
+    # coordinator 经初始 state 注入的红线规则应穿透到草稿 prompt
+    result = await graph.ainvoke(_base_state(compliance_rules=["不得承诺退款到账时间"]))
+
+    assert result["draft_category"] == "aftersale"
+    assert result["draft_subject"] == "Re: 取消订单"
+    assert result["draft_sources"][0]["document_id"] == 11
+    # 中文邮件：analyze 1 次 + 草稿 1 次（翻译节点 zh 短路零调用）
+    assert [name for name, _ in model.calls] == ["EmailAnalysisOutput", "EmailDraftOutput"]
+    assert retriever.calls[0][0] == "sop"
+    assert "- 不得承诺退款到账时间" in model.calls[-1][1][1].content
+
+
+async def test_compiled_graph_english_presale_email_generates_draft() -> None:
+    """英文售前邮件全流程：analyze → 翻译 → 草稿（faq 检索），三次 LLM 调用。"""
+    retriever = FakeRetriever(chunks=[_hit(21, 0.3, "Bulk discounts start at 100 units.")])
+    model = FakeChatModel(
+        outcomes=[
+            _analysis_success_output(intent=INTENT_PRE_SALES_CONSULT),
+            _translation_success_output(),
+            _draft_output(subject="Re: Bulk discount", body="Thank you for your interest."),
+        ]
+    )
+    graph = build_email_analysis_graph(model, knowledge_retriever=retriever)
+    state = _base_state(
+        subject="Bulk discount inquiry",
+        cleaned_text="We plan to purchase 500 units. Do you offer discounts?",
+    )
+
+    result = await graph.ainvoke(state)
+
+    assert result["draft_category"] == "presale"
+    assert result["draft_subject"] == "Re: Bulk discount"
+    assert [name for name, _ in model.calls] == [
+        "EmailAnalysisOutput",
+        "EmailTranslationOutput",
+        "EmailDraftOutput",
+    ]
+    assert retriever.calls[0][0] == "faq"
+
+
+async def test_compiled_graph_draft_failure_does_not_break_analysis() -> None:
+    """草稿检索失败降级：意向分析结果完整保留，仅记 draft_skipped_reason。"""
+    retriever = FakeRetriever(error=RuntimeError("kb down"))
+    model = FakeChatModel(output=_analysis_success_output())
+    graph = build_email_analysis_graph(model, knowledge_retriever=retriever)
+
+    result = await graph.ainvoke(_base_state())
+
+    assert result["primary_intent"] == "cancel_order"
+    assert result["draft_skipped_reason"] == "retrieval_failed"
+    assert "draft_subject" not in result
+
+
+async def test_compiled_graph_without_retriever_never_enters_draft() -> None:
+    """未注入检索器：草稿分支永不进入，终态无任何草稿键。"""
+    model = FakeChatModel(output=_analysis_success_output())
+    graph = build_email_analysis_graph(model)
+
+    result = await graph.ainvoke(_base_state())
+
+    assert result["primary_intent"] == "cancel_order"
+    assert "draft_subject" not in result
+    assert "draft_skipped_reason" not in result

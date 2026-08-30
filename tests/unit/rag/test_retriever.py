@@ -14,6 +14,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.db import KbChunk
 from app.db.engine import Database
+from app.db.repositories import KbChunkSimilarityRow
 from app.rag.embedding import KnowledgeEmbedder
 from app.rag.errors import EmbeddingDimensionError
 from app.rag.retriever import KnowledgeRetriever, RetrievedChunk
@@ -48,7 +49,7 @@ def _make_chunk(document_id: int = 1, chunk_index: int = 0) -> KbChunk:
     )
 
 
-def _stub_repo_factory(calls: list[dict], hits: list[tuple[KbChunk, float]]):
+def _stub_repo_factory(calls: list[dict], hits: list[KbChunkSimilarityRow]):
     """构造记录调用参数的 stub 仓储类，替身 KbChunkRepository。"""
 
     class _StubChunkRepository:
@@ -62,7 +63,7 @@ def _stub_repo_factory(calls: list[dict], hits: list[tuple[KbChunk, float]]):
             *,
             top_k: int = 5,
             embedding_model: str | None = None,
-        ) -> list[tuple[KbChunk, float]]:
+        ) -> list[KbChunkSimilarityRow]:
             calls.append(
                 {
                     "kb_type": kb_type,
@@ -92,7 +93,10 @@ class TestRetrieve:
         chunk = _make_chunk()
         monkeypatch.setattr(
             "app.rag.retriever.KbChunkRepository",
-            _stub_repo_factory(calls, [(chunk, 0.25)]),
+            _stub_repo_factory(
+                calls,
+                [KbChunkSimilarityRow(chunk=chunk, document_title="售后政策", distance=0.25)],
+            ),
         )
         retriever = KnowledgeRetriever(_make_embedder(), database)
 
@@ -109,6 +113,7 @@ class TestRetrieve:
         assert isinstance(hits[0], RetrievedChunk)
         assert hits[0].content == chunk.content
         assert hits[0].document_id == chunk.document_id
+        assert hits[0].document_title == "售后政策"
         assert hits[0].distance == pytest.approx(0.25)
 
     async def test_top_k_override_wins(

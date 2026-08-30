@@ -1,35 +1,42 @@
-"""单邮件意向分析 LangGraph：analyze → (条件边) → detect_and_translate → END。
+"""单邮件意向分析 LangGraph：analyze → (条件边) → detect_and_translate → (条件边) → 草稿分支 → END。
 
 从 coordinator 拿到清洗后的正文与附件数据后进入本图：analyze 先做附件内容
 提取（.eml 附件递归解析、图片视觉识别——均在本节点内完成，不新增节点），
 组装分层视图后在原文上完成结构化意向分析；随后按主意图条件路由——
 垃圾/通知类（TRANSLATION_EXCLUDED_INTENTS）直接结束，其余邮件进入
-detect_and_translate 节点（检测语言并翻译为中文，译文仅落库展示，不回灌 analyze）。
+detect_and_translate 节点（检测语言并翻译为中文，译文仅落库展示，不回灌 analyze）；
+翻译结束后第二次条件路由：主意图命中 ``DRAFT_CATEGORY_BY_INTENT``（售前/售后
+咨询类）且注入了 KnowledgeRetriever 时，进入 draft_presale / draft_aftersale
+节点——检索知识库（售前查 faq、售后查 sop），质量门槛通过后起草回复草稿。
+草稿只写进 state 由 coordinator 落 email_drafts 待人工确认，本图不发送邮件。
 
 附件数据流：coordinator 查询附件（含 COS 拉取的字节或已有提取缓存）放入
 初始 state 的 ``attachments``；analyze 提取后产出 ``attachment_views``（分层
 视图段）与 ``extracted_cache``（供 coordinator 写回缓存）及
-``intent_evidence_source``（意图证据来源）。本图自身不触 DB、不做网络存储
-IO，字节由调用方备好放进 state。
+``intent_evidence_source``（意图证据来源）。本图自身不触 DB；唯一的外部 IO
+是草稿节点经闭包注入的 KnowledgeRetriever（向量检索）。
 
 构建方式：
-    graph = build_email_analysis_graph(chat_model, vision_model=None)
+    graph = build_email_analysis_graph(chat_model, vision_model=None, knowledge_retriever=None)
     result = await graph.ainvoke(initial_state)
 
 调用链追踪与日志（handler 见 app.agent.trace_handle，实时输出结构化日志并收集事件）：
     handler = GraphTraceHandler()
     result = await graph.ainvoke(initial_state, config={"callbacks": [handler]})
 
-错误处理：LLM 调用失败统一抛 ``LLMInvocationError``，原样穿透 ``ainvoke``
-（LangGraph 不包装节点异常，异常链保留在 ``__cause__``），由调用方
-``except AnalysisGraphError`` 捕获；节点其余逻辑错误不捕获、原样传播。
-LLMInvocationError 由节点级 RetryPolicy 自动重试一次。附件图片识别失败
-在提取函数内部降级（返回 None），不触发节点重试。
+错误处理：analyze / detect_and_translate 的 LLM 调用失败统一抛
+``LLMInvocationError``，原样穿透 ``ainvoke``（LangGraph 不包装节点异常，异常链
+保留在 ``__cause__``），由调用方 ``except AnalysisGraphError`` 捕获；两节点各挂
+节点级 RetryPolicy 自动重试一次。草稿节点刻意不挂 RetryPolicy、内部捕获全部
+异常降级为 ``draft_skipped_reason``（检索失败记一条 warning，其余异常的 LLM
+事件已由 handler 记录）——草稿是附加产物，任何草稿失败都不应拖垮已完成的
+意向分析。附件图片识别失败在提取函数内部降级（返回 None），不触发节点重试。
 
-日志全部由 GraphTraceHandler 回调实时输出（节点自身零日志），业务上下文
-（email_id / account_id）由调用方经 ``structlog.contextvars`` 注入。
+日志全部由 GraphTraceHandler 回调实时输出（节点自身零日志，草稿节点的检索
+降级 warning 除外），业务上下文（email_id / account_id）由调用方经
+``structlog.contextvars`` 注入。
 
-依赖全部闭包注入，无模块级全局，不触碰 DB。
+依赖全部闭包注入，无模块级全局，除草稿节点的检索外不触碰 DB。
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ import asyncio
 from functools import partial
 from typing import Any, Optional, TypedDict
 
+import structlog
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -47,6 +55,10 @@ from pydantic import ValidationError
 
 from app.agent.constants import (
     ANALYSIS_MAX_BODY_CHARS,
+    DRAFT_COMPLIANCE_MAX_CHARS,
+    DRAFT_MAX_COSINE_DISTANCE,
+    DRAFT_QUERY_MAX_CHARS,
+    DRAFT_RETRIEVAL_TOP_K,
     HAN_RANGE,
     HANGUL_RANGE,
     KANA_RANGE,
@@ -56,18 +68,33 @@ from app.agent.constants import (
     SHORT_SHELL_CHARS,
 )
 from app.agent.errors import LLMInvocationError
-from app.agent.prompts import EMAIL_ANALYSIS_SYSTEM_PROMPT, EMAIL_TRANSLATE_SYSTEM_PROMPT
+from app.agent.prompts import (
+    DRAFT_AFTERSALE_SYSTEM_PROMPT,
+    DRAFT_PRESALE_SYSTEM_PROMPT,
+    EMAIL_ANALYSIS_SYSTEM_PROMPT,
+    EMAIL_TRANSLATE_SYSTEM_PROMPT,
+)
 from app.schemas.analysis import (
     TRANSLATION_EXCLUDED_INTENTS,
     EmailAnalysisOutput,
     EmailTranslationOutput,
 )
+from app.schemas.draft import (
+    DRAFT_CATEGORY_AFTER_SALE,
+    DRAFT_CATEGORY_BY_INTENT,
+    DRAFT_CATEGORY_PRE_SALE,
+    EmailDraftOutput,
+)
+from app.schemas.knowledge import KB_TYPE_FAQ, KB_TYPE_SOP
 from app.services.attachment_extract import (
     MAX_EXTRACT_CHARS,
     extract_eml_text,
     extract_image_text,
 )
 from app.services.preprocess import compose_email_view
+
+#: 检索降级是节点内唯一的非 LLM 日志（LLM 事件全部由 GraphTraceHandler 输出）
+_logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # 状态定义
@@ -89,6 +116,9 @@ class EmailAnalysisState(TypedDict, total=False):
     # coordinator 放入的附件数据（字节由调用方备好，含 COS 拉取或已有提取缓存）
     attachments: list[dict]
 
+    # coordinator 全量读出的合规红线块文本（不走向量召回），草稿 prompt 注入用
+    compliance_rules: list[str]
+
     # analyze 节点附件提取产出
     attachment_views: list[dict]  # 分层视图段 [{"kind", "filename", "text"}]
     extracted_cache: list[dict]  # [{"attachment_id", "extracted_text"}]，coordinator 写回缓存
@@ -108,6 +138,15 @@ class EmailAnalysisState(TypedDict, total=False):
     priority: str
     suggested_tools: list[str]
     llm_model: str
+
+    # 草稿节点产出（draft_presale / draft_aftersale，coordinator 落 email_drafts）
+    draft_category: str
+    draft_subject: str
+    draft_body: str
+    draft_sources: list[dict]  # [{"document_id", "title", "distance", "snippet"}]，人工核对依据
+    draft_model: str
+    # 草稿降级原因：no_relevant_knowledge / retrieval_failed / generation_failed 等
+    draft_skipped_reason: str
 
 
 async def _extract_attachment_views(
@@ -311,20 +350,166 @@ def _route_translation_by_primary_intent(state: EmailAnalysisState) -> str:
     return "detect_and_translate"
 
 
-def build_email_analysis_graph(chat_model: Any, vision_model: Any | None = None):
+def _route_after_translation(state: EmailAnalysisState, *, has_retriever: bool) -> str:
+    """翻译后的第二次条件路由：命中草稿意图映射且检索器可用时进入对应草稿节点。
+
+    意图不在 ``DRAFT_CATEGORY_BY_INTENT``（ToB / meeting / other / spam / unknown）
+    或构建图时未注入 KnowledgeRetriever（embedding 未配置）→ 直接结束，不出草稿。
+    """
+    if not has_retriever:
+        return END
+    category = DRAFT_CATEGORY_BY_INTENT.get(state.get("primary_intent") or "")
+    if category == DRAFT_CATEGORY_PRE_SALE:
+        return "draft_presale"
+    if category == DRAFT_CATEGORY_AFTER_SALE:
+        return "draft_aftersale"
+    return END
+
+
+async def _draft_node(
+    state: EmailAnalysisState,
+    # langgraph 按注解字面匹配来注入 config，仅认 RunnableConfig/Optional[RunnableConfig]，
+    # 不识别 PEP 604 的 `X | None`（本文件启用 future annotations 后注解为字符串，须用 Optional）
+    config: Optional[RunnableConfig] = None,  # noqa: UP045
+    *,
+    chat_model: Any,
+    retriever: Any,
+    category: str,
+    system_prompt: str,
+    kb_type: str,
+    max_body_chars: int = ANALYSIS_MAX_BODY_CHARS,
+) -> dict:
+    """检索知识库并起草待人工确认的回复草稿，失败一律降级、不抛错。
+
+    流程：意图→类别二次校验（防路由错配）→ 组检索 query → 知识库向量检索 →
+    质量门槛（无命中或最近余弦距离超 ``DRAFT_MAX_COSINE_DISTANCE`` 视为无相关
+    知识，业界共识是低置信不硬答）→ 红线规则（coordinator 全量注入，非召回）
+    + 知识摘录 + 分层视图 + 客户语言拼 prompt → 单次 LLM 结构化调用产出
+    subject/body。
+
+    草稿是意向分析的附加产物：本节点不挂 RetryPolicy、内部捕获全部异常降级为
+    ``draft_skipped_reason``，保证任何草稿失败都不影响已完成的意向分析落库。
+    检索失败（非 LLM 的网络 IO，handler 覆盖不到）由节点记一条 warning；
+    LLM 事件已由 GraphTraceHandler 记录，节点不再重复。
+    """
+    primary = state.get("primary_intent") or ""
+    if DRAFT_CATEGORY_BY_INTENT.get(primary) != category:
+        return {"draft_skipped_reason": "intent_category_mismatch"}
+
+    subject = state.get("subject", "")
+    cleaned = state.get("cleaned_text", "")
+    query = f"{subject}\n{cleaned}".strip()[:DRAFT_QUERY_MAX_CHARS]
+    if not query:
+        return {"draft_skipped_reason": "empty_query"}
+
+    try:
+        chunks = await retriever.retrieve(kb_type, query, top_k=DRAFT_RETRIEVAL_TOP_K)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "draft_retrieval_failed",
+            category=category,
+            kb_type=kb_type,
+            error=f"{type(exc).__name__}: {exc}"[:300],
+        )
+        return {"draft_skipped_reason": "retrieval_failed"}
+
+    if not chunks or min(chunk.distance for chunk in chunks) > DRAFT_MAX_COSINE_DISTANCE:
+        return {"draft_skipped_reason": "no_relevant_knowledge"}
+
+    knowledge_block = "\n\n".join(
+        f"[document_id={chunk.document_id} title={chunk.document_title} "
+        f"distance={chunk.distance:.4f}]\n{chunk.content}"
+        for chunk in chunks
+    )
+    view = compose_email_view(
+        subject=subject,
+        sender=state.get("sender"),
+        sent_at=state.get("sent_at"),
+        cleaned_text=cleaned[:max_body_chars],
+        attachment_views=state.get("attachment_views"),
+    )
+
+    # 红线规则由 coordinator 全量注入（不走向量召回，保证恒在场）；以整条规则为
+    # 单位做字符预算，放不下整条时舍弃其后全部，避免截断出残缺规则误导模型
+    sections: list[str] = []
+    rule_lines: list[str] = []
+    used = 0
+    for rule in state.get("compliance_rules", []):
+        text = str(rule).strip()
+        if not text:
+            continue
+        line = f"- {text}"
+        if used + len(line) + 1 > DRAFT_COMPLIANCE_MAX_CHARS:
+            break
+        rule_lines.append(line)
+        used += len(line) + 1
+    if rule_lines:
+        sections.append("## 红线规则（知识库，优先级最高）\n\n" + "\n".join(rule_lines))
+    sections.append(f"## 知识库摘录\n\n{knowledge_block}")
+
+    human = (
+        f"{view}\n\n"
+        + "\n\n".join(sections)
+        + f"\n\n客户语言: {state.get('source_language') or 'unknown'}"
+    )
+
+    try:
+        structured = chat_model.with_structured_output(EmailDraftOutput, method="function_calling")
+        result = await asyncio.wait_for(
+            structured.ainvoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=human),
+                ],
+                config=config,
+            ),
+            timeout=LLM_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:  # noqa: BLE001
+        # LLM 超时/网络/解析失败均降级；具体错误已由 GraphTraceHandler 记录
+        return {"draft_skipped_reason": "generation_failed"}
+
+    if result is None:
+        return {"draft_skipped_reason": "generation_failed"}
+
+    return {
+        "draft_category": category,
+        "draft_subject": result.subject,
+        "draft_body": result.body,
+        "draft_sources": [
+            {
+                "document_id": chunk.document_id,
+                "title": chunk.document_title,
+                "distance": round(chunk.distance, 4),
+                "snippet": chunk.content[:200],
+            }
+            for chunk in chunks
+        ],
+        "draft_model": getattr(chat_model, "model_name", "unknown"),
+    }
+
+
+def build_email_analysis_graph(
+    chat_model: Any, vision_model: Any | None = None, knowledge_retriever: Any | None = None
+):
     """构建单邮件意向分析图，依赖全部闭包注入。
 
     ``vision_model`` 为视觉 LLM 客户端（识别图片附件用），None 时跳过图片
     识别（.eml 附件解析不受影响）。
+
+    ``knowledge_retriever`` 为知识库检索器（回复草稿用），None 时草稿分支
+    永不进入（路由直达 END），图结构不变。
 
     调用链追踪：ainvoke 时传 ``config={"callbacks": [GraphTraceHandler()]}``，
     结束后由 ``handler.dump()`` 取事件列表（用法见模块 docstring）。
 
     analyze 与 detect_and_translate 节点各挂 RetryPolicy：仅对 LLMInvocationError
     重试（次数见 ``constants.LLM_NODE_MAX_ATTEMPTS``，含首次），重试耗尽后异常
-    原样抛给 ainvoke 调用方。
-    analyze 之后按主意图条件路由：垃圾/通知类（TRANSLATION_EXCLUDED_INTENTS）
-    直接结束，其余进入 detect_and_translate。
+    原样抛给 ainvoke 调用方。草稿节点不挂 RetryPolicy，内部全量降级（见
+    ``_draft_node`` docstring）。
+
+    条件路由 ×2：analyze 之后按主意图排除垃圾/通知类；detect_and_translate
+    之后按 ``DRAFT_CATEGORY_BY_INTENT`` 映射进入售前/售后草稿节点。
     """
 
     builder = StateGraph(EmailAnalysisState)
@@ -343,13 +528,45 @@ def build_email_analysis_graph(chat_model: Any, vision_model: Any | None = None)
             max_attempts=LLM_NODE_MAX_ATTEMPTS, retry_on=(LLMInvocationError,)
         ),
     )
+    builder.add_node(
+        "draft_presale",
+        partial(
+            _draft_node,
+            chat_model=chat_model,
+            retriever=knowledge_retriever,
+            category=DRAFT_CATEGORY_PRE_SALE,
+            system_prompt=DRAFT_PRESALE_SYSTEM_PROMPT,
+            kb_type=KB_TYPE_FAQ,
+        ),
+    )
+    builder.add_node(
+        "draft_aftersale",
+        partial(
+            _draft_node,
+            chat_model=chat_model,
+            retriever=knowledge_retriever,
+            category=DRAFT_CATEGORY_AFTER_SALE,
+            system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+            kb_type=KB_TYPE_SOP,
+        ),
+    )
 
     builder.add_conditional_edges(
         "analyze",
         _route_translation_by_primary_intent,
         {"detect_and_translate": "detect_and_translate", END: END},
     )
-    builder.add_edge("detect_and_translate", END)
+    builder.add_conditional_edges(
+        "detect_and_translate",
+        partial(_route_after_translation, has_retriever=knowledge_retriever is not None),
+        {
+            "draft_presale": "draft_presale",
+            "draft_aftersale": "draft_aftersale",
+            END: END,
+        },
+    )
+    builder.add_edge("draft_presale", END)
+    builder.add_edge("draft_aftersale", END)
 
     builder.set_entry_point("analyze")
 

@@ -23,6 +23,8 @@ INTENT_ORDER_STATUS_QUERY = "order_status_query"
 INTENT_INVOICE_QUERY = "invoice_query"
 INTENT_MEETING_REQUEST = "meeting_request"
 INTENT_COMPLAINT = "complaint"
+INTENT_PRE_SALES_CONSULT = "pre_sales_consult"
+INTENT_AFTER_SALES_CONSULT = "after_sales_consult"
 INTENT_SPAM_OR_NOTICE = "spam_or_notice"
 INTENT_OTHER = "other"
 INTENT_CONTRACT = "contract"
@@ -39,6 +41,8 @@ CONSUMER_INTENTS: dict[str, str] = {
     INTENT_INVOICE_QUERY: "发票/账单查询",
     INTENT_MEETING_REQUEST: "会议/日程请求",
     INTENT_COMPLAINT: "投诉/不满表达",
+    INTENT_PRE_SALES_CONSULT: "售前咨询：产品信息/材质/价格/优惠券活动/库存/发货时效等购买前问题",
+    INTENT_AFTER_SALES_CONSULT: "售后咨询：退换货政策/保修维护/使用方法等售后问题",
     INTENT_SPAM_OR_NOTICE: "垃圾邮件/系统通知/广告",
     INTENT_OTHER: "无法归类的消费者意图",
 }
@@ -67,6 +71,8 @@ INTENT_LITERAL = Literal[
     "invoice_query",
     "meeting_request",
     "complaint",
+    "pre_sales_consult",
+    "after_sales_consult",
     "spam_or_notice",
     "other",
     "contract",

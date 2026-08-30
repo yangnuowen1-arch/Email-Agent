@@ -7,15 +7,25 @@ Repository 内部不提交事务，仅通过 ``flush()`` 获取主键。
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas import ParsedEmail
+from app.schemas.draft import ALL_DRAFT_STATUSES, DRAFT_STATUS_PENDING
 from app.schemas.knowledge import ALL_KB_TYPES, KB_EMBEDDING_DIMENSIONS, KB_STATUS_ACTIVE
 
-from .db import Account, EmailAnalysis, EmailAttachment, EmailMessage, KbChunk, KbDocument
+from .db import (
+    Account,
+    EmailAnalysis,
+    EmailAttachment,
+    EmailDraft,
+    EmailMessage,
+    KbChunk,
+    KbDocument,
+)
 
 
 class EmailAccountRepository:
@@ -442,6 +452,95 @@ class EmailAnalysisRepository:
 
 
 # ---------------------------------------------------------------------------
+# 回复草稿 Repository（人工确认流：状态流转见 docs/db-schema.md §2.9）
+# ---------------------------------------------------------------------------
+
+
+class EmailDraftRepository:
+    """email_drafts 表的异步访问入口。"""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def get_email_draft_by_id(self, draft_id: int) -> EmailDraft | None:
+        """按主键查询单条草稿。"""
+        return await self.session.get(EmailDraft, draft_id)
+
+    async def get_email_draft_by_email_id(self, email_id: int) -> EmailDraft | None:
+        """按唯一键查询单条草稿。"""
+        stmt = select(EmailDraft).where(EmailDraft.email_id == email_id)
+        return await self.session.scalar(stmt)
+
+    async def list_email_draft_by_status(self, status: str) -> list[EmailDraft]:
+        """按确认状态查询草稿列表（人工确认队列），按生成时间倒序。"""
+        stmt = (
+            select(EmailDraft)
+            .where(EmailDraft.status == status)
+            .order_by(EmailDraft.created_at.desc())
+        )
+        result = await self.session.scalars(stmt)
+        return list(result.all())
+
+    async def upsert_email_draft(self, entity: EmailDraft) -> EmailDraft:
+        """幂等写入：ON CONFLICT (email_id) DO UPDATE，返回带 id 的实体。
+
+        重生成即整体覆盖最新草稿，status 重置回 pending 等待重新确认。
+        对应 db-schema.md §2.9 的写入方式。
+        """
+        if not isinstance(entity, EmailDraft):
+            msg = f"expected EmailDraft, got {type(entity).__name__}"
+            raise TypeError(msg)
+
+        now = datetime.now(UTC)
+        stmt = (
+            pg_insert(EmailDraft)
+            .values(
+                email_id=entity.email_id,
+                account_id=entity.account_id,
+                category=entity.category,
+                status=DRAFT_STATUS_PENDING,
+                subject=entity.subject,
+                body=entity.body,
+                sources=entity.sources,
+                model=entity.model,
+            )
+            .on_conflict_do_update(
+                index_elements=["email_id"],
+                set_={
+                    "account_id": entity.account_id,
+                    "category": entity.category,
+                    "status": DRAFT_STATUS_PENDING,
+                    "subject": entity.subject,
+                    "body": entity.body,
+                    "sources": entity.sources,
+                    "model": entity.model,
+                    "updated_at": now,
+                },
+            )
+            .returning(EmailDraft.id)
+        )
+        result = await self.session.execute(stmt)
+        row = result.fetchone()
+        if row:
+            entity.id = row[0]  # type: ignore[assignment]
+        return entity
+
+    async def update_email_draft_status_by_id(self, draft_id: int, status: str) -> bool:
+        """人工确认动作：更新草稿确认状态，返回是否存在该草稿。"""
+        if status not in set(ALL_DRAFT_STATUSES):
+            msg = f"status must be one of {sorted(ALL_DRAFT_STATUSES)}, got {status!r}"
+            raise ValueError(msg)
+
+        stmt = (
+            update(EmailDraft)
+            .where(EmailDraft.id == draft_id)
+            .values(status=status, updated_at=datetime.now(UTC))
+        )
+        result = await self.session.execute(stmt)
+        return bool(result.rowcount)
+
+
+# ---------------------------------------------------------------------------
 # 知识库 Repository（RAG，与邮件链路零接线）
 # ---------------------------------------------------------------------------
 
@@ -453,6 +552,14 @@ def _validate_kb_type(kb_type: str) -> None:
         raise ValueError(msg)
 
 
+class KbChunkSimilarityRow(NamedTuple):
+    """相似度检索行：分块 + 所属文档标题 + 余弦距离（距离越小越相似）。"""
+
+    chunk: KbChunk
+    document_title: str
+    distance: float
+
+
 def _build_similarity_stmt(
     kb_type: str,
     query_embedding: list[float],
@@ -462,18 +569,18 @@ def _build_similarity_stmt(
 ):
     """构造余弦相似度检索语句（纯函数，便于单测检验过滤与排序封装）。
 
-    过滤：kb_type 精确匹配 + 所属文档 status=active（归档知识不参与检索）
-    + 可选 embedding_model 匹配；排序：余弦距离升序，取前 top_k 条。
+    过滤：kb_type 精确匹配 + join 所属文档要求 status=active（归档知识不参与
+    检索）+ 可选 embedding_model 匹配；排序：余弦距离升序，取前 top_k 条；
+    每行带出所属文档标题（供草稿上下文标注知识出处）。
     """
     distance = KbChunk.embedding.cosine_distance(query_embedding)
     stmt = (
-        select(KbChunk, distance)
+        select(KbChunk, KbDocument.title, distance)
+        .join(KbDocument, KbChunk.document_id == KbDocument.id)
         .where(
             KbChunk.kb_type == kb_type,
             # 检索只取 active 文档的块：归档下线的知识不再命中
-            KbChunk.document_id.in_(
-                select(KbDocument.id).where(KbDocument.status == KB_STATUS_ACTIVE)
-            ),
+            KbDocument.status == KB_STATUS_ACTIVE,
         )
         .order_by(distance)
         .limit(top_k)
@@ -583,6 +690,31 @@ class KbChunkRepository:
         result = await self.session.scalars(stmt)
         return list(result.all())
 
+    async def list_kb_chunk_by_kb_type(
+        self, kb_type: str, *, active_only: bool = True
+    ) -> list[KbChunk]:
+        """按知识类型全量列出分块（非向量），按文档与块内序号稳定排序。
+
+        供"恒在场"类知识（如合规红线）全量读取注入 prompt，不经相似度召回；
+        active_only=True 时仅返回生效文档的块（归档知识不参与注入）。
+        """
+        _validate_kb_type(kb_type)
+
+        stmt = (
+            select(KbChunk)
+            .where(KbChunk.kb_type == kb_type)
+            .order_by(KbChunk.document_id, KbChunk.chunk_index)
+        )
+        if active_only:
+            stmt = stmt.where(
+                KbChunk.document_id.in_(
+                    select(KbDocument.id).where(KbDocument.status == KB_STATUS_ACTIVE)
+                )
+            )
+
+        result = await self.session.scalars(stmt)
+        return list(result.all())
+
     async def create_kb_chunk(self, entity: KbChunk) -> KbChunk:
         """插入单个分块，flush 后返回带主键的实体。"""
         if not isinstance(entity, KbChunk):
@@ -620,12 +752,13 @@ class KbChunkRepository:
         *,
         top_k: int = 5,
         embedding_model: str | None = None,
-    ) -> list[tuple[KbChunk, float]]:
+    ) -> list[KbChunkSimilarityRow]:
         """按余弦距离检索某知识类型下最相近的 top_k 个分块。
 
         过滤条件：kb_type 精确匹配 + 所属文档 status=active（归档知识不参与检索）
         + 可选 embedding_model 匹配（不同模型的向量不可比，生产检索必须传）。
-        返回 (分块, 余弦距离) 列表，按距离升序；距离越小越相似。
+        返回 (分块, 文档标题, 余弦距离) 行列表，按距离升序；距离越小越相似，
+        标题供调用方在草稿上下文与来源核对中标注知识出处。
         """
         _validate_kb_type(kb_type)
         if not isinstance(top_k, int) or top_k <= 0:
@@ -653,4 +786,7 @@ class KbChunkRepository:
         )
 
         rows = await self.session.execute(stmt)
-        return [(chunk, float(dist)) for chunk, dist in rows.all()]
+        return [
+            KbChunkSimilarityRow(chunk=chunk, document_title=title, distance=float(dist))
+            for chunk, title, dist in rows.all()
+        ]

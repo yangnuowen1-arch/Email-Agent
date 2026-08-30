@@ -33,3 +33,17 @@ LLM_NODE_MAX_ATTEMPTS: int = 2
 SHORT_SHELL_CHARS: int = 200
 #: 单封邮件最多识别的图片附件数
 MAX_IMAGES_PER_EMAIL: int = 3
+
+# ---------------------------------------------------------------------------
+# 回复草稿（draft_presale / draft_aftersale 节点，RAG 检索门槛）
+# ---------------------------------------------------------------------------
+
+#: 草稿节点检索的知识块条数
+DRAFT_RETRIEVAL_TOP_K: int = 4
+#: 检索质量门槛：最近一条的余弦距离超过该值视为无相关知识，不出草稿。
+#: 该值与 embedding 模型强相关，上线后按真实召回分布调整
+DRAFT_MAX_COSINE_DISTANCE: float = 0.8
+#: 检索 query 截断长度（主题 + 正文拼接后截断）
+DRAFT_QUERY_MAX_CHARS: int = 500
+#: 草稿 prompt 注入红线规则的总字符预算（整条规则为单位，放不下整条就舍弃其后全部）
+DRAFT_COMPLIANCE_MAX_CHARS: int = 2000

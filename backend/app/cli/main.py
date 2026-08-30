@@ -8,8 +8,15 @@ import typer
 
 from app.core.container import Container
 from app.core.settings import AppConfig
+from app.db.repositories import EmailDraftRepository
 from app.llm.errors import LLMConfigurationError
 from app.rag.errors import RAGError
+from app.schemas.draft import (
+    ALL_DRAFT_STATUSES,
+    DRAFT_STATUS_APPROVED,
+    DRAFT_STATUS_PENDING,
+    DRAFT_STATUS_REJECTED,
+)
 
 app = typer.Typer(
     help="email-agent-cli",
@@ -140,6 +147,71 @@ def kb_search(
         )
         typer.echo(hit.content)
         typer.echo("---")
+
+
+@app.command(name="draft_list")
+def draft_list(
+    ctx: typer.Context,
+    status: str = typer.Option(
+        DRAFT_STATUS_PENDING, "--status", help="草稿状态：pending / approved / rejected"
+    ),
+    limit: int = typer.Option(20, "--limit", min=1, help="返回条数"),
+) -> None:
+    """列出回复草稿（默认待确认队列）；草稿需人工确认，本系统不发送邮件。"""
+    container: Container = ctx.obj
+    if not container.config.database_url:
+        typer.echo("DATABASE_URL is required for draft_list", err=True)
+        raise typer.Exit(code=2)
+    if status not in ALL_DRAFT_STATUSES:
+        typer.echo(f"status must be one of {sorted(ALL_DRAFT_STATUSES)}", err=True)
+        raise typer.Exit(code=2)
+
+    async def _list():
+        async with container.database.session() as session:
+            drafts = await EmailDraftRepository(session).list_email_draft_by_status(status)
+            return drafts[:limit]
+
+    drafts = asyncio.run(_list())
+    if not drafts:
+        typer.echo(f"no drafts with status={status}")
+        return
+    for d in drafts:
+        typer.echo(f"draft_id={d.id} email_id={d.email_id} category={d.category} status={d.status}")
+        typer.echo(f"  subject: {d.subject}")
+        typer.echo("  body:")
+        for line in d.body.splitlines():
+            typer.echo(f"    {line}")
+        typer.echo(f"  sources: {len(d.sources)} 条检索依据（document_id 见 kb_documents）")
+
+
+@app.command(name="draft_review")
+def draft_review(
+    ctx: typer.Context,
+    draft_id: int = typer.Argument(..., help="草稿 ID（见 draft_list）"),
+    approve: bool = typer.Option(False, "--approve", help="确认可用"),
+    reject: bool = typer.Option(False, "--reject", help="否决草稿"),
+) -> None:
+    """人工确认回复草稿（--approve / --reject 恰选其一）；仅改状态，不发送邮件。"""
+    container: Container = ctx.obj
+    if not container.config.database_url:
+        typer.echo("DATABASE_URL is required for draft_review", err=True)
+        raise typer.Exit(code=2)
+    if approve == reject:
+        typer.echo("choose exactly one of --approve / --reject", err=True)
+        raise typer.Exit(code=2)
+    status = DRAFT_STATUS_APPROVED if approve else DRAFT_STATUS_REJECTED
+
+    async def _review() -> bool:
+        async with container.database.session() as session:
+            return await EmailDraftRepository(session).update_email_draft_status_by_id(
+                draft_id, status
+            )
+
+    updated = asyncio.run(_review())
+    if not updated:
+        typer.echo(f"draft not found: {draft_id}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"draft_id={draft_id} status={status}")
 
 
 @app.command()

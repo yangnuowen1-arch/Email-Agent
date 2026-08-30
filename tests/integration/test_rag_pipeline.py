@@ -167,6 +167,8 @@ class TestIngestThenRetrieve:
         assert all(h.chunk.embedding_model == MODEL_NAME for h in hits)
         # doc A 入库时带了 metadata，doc B 未带：块级 meta 各自正确落库
         assert hits[0].chunk.meta == {"tags": ["itest"]}
+        # 检索行带出所属文档标题（真实 join 数据）
+        assert hits[0].document_title == "聚簇甲知识"
 
     async def test_reingest_same_content_skips(self, pg_database: Database) -> None:
         ingestor, client = _make_ingestor(pg_database)
