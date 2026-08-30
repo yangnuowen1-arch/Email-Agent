@@ -15,12 +15,18 @@ email_accounts (1) ──────< (N) emails
         email_attachments                email_analyses
         附件元数据+COS引用(输出)          结构化分析(输出)
         ← 按 email_id 关联               ← email_id 唯一
+
+kb_documents (1) ──────< (N) kb_chunks
+     │                        │
+ 知识文档(输入)            分块向量(检索单元)
+     └── kb_type 冗余 ────────┘  ← 检索按类型过滤免 join
 ```
 
 - 一条 `email_accounts` 记录对应一个真实邮箱，是程序的唯一输入源。
 - `emails.account_id` 外键关联到账号，`(account_id, uid)` 唯一约束保证同一邮箱内邮件不重复入库。
 - `email_analyses.email_id` 唯一约束保证一封邮件至多一份分析结果，支撑 `ON CONFLICT (email_id) DO UPDATE` 幂等重跑。
 - `email_attachments.email_id` 逻辑外键关联到邮件，一行 = 一个附件的元数据 + COS 对象引用；**附件字节不上库**，存腾讯云 COS，DB 只存 `storage_url` / `storage_key`。
+- `kb_documents`/`kb_chunks` 是 RAG 知识库（回复草稿的知识支撑），与邮件链路**零接线**：文档级管幂等重入库与归档，块级管向量检索；`kb_type` 从文档冗余到块，类型过滤不需要 join。
 
 ## 2. 表结构
 
@@ -292,6 +298,109 @@ COMMENT ON COLUMN email_attachments.created_at IS '入库时间（UTC），插�
 
 `primary_intent` 与 `intents[].category` 均取本表枚举值。
 
+### 2.6 kb_documents — 知识库文档表（RAG 输入）
+
+```sql
+-- 前置：启用 pgvector 扩展（kb_chunks.embedding 依赖，需 DB 执行权限）
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE kb_documents (
+    id           SERIAL PRIMARY KEY,
+    kb_type      TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    source_type  TEXT NOT NULL DEFAULT 'text',
+    source_key   TEXT NOT NULL UNIQUE,
+    content_hash TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'active',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE kb_documents IS '知识库文档表（RAG 输入）：文档级管理语义，检索粒度在 kb_chunks';
+COMMENT ON COLUMN kb_documents.id IS '自增主键，kb_chunks.document_id 逻辑外键引用它';
+COMMENT ON COLUMN kb_documents.kb_type IS '知识类型：faq（业务与产品 FAQ）/ sop（沟通 SOP 与语气）/ compliance（合规与红线规则），白名单见「知识类型表」';
+COMMENT ON COLUMN kb_documents.title IS '文档标题，用于展示与运维定位';
+COMMENT ON COLUMN kb_documents.source_type IS '来源形态：mail（邮件提取）/ file（文件导入）/ text（手工维护）';
+COMMENT ON COLUMN kb_documents.source_key IS '来源幂等键（文件路径、URL、自造标识等），UNIQUE 保证同来源重入库不产生重复';
+COMMENT ON COLUMN kb_documents.content_hash IS '原文 SHA-256，变更检测：hash 不同才重新分块与嵌入';
+COMMENT ON COLUMN kb_documents.status IS '知识状态：active（生效，参与检索）/ archived（归档下线，仅留档审计）';
+COMMENT ON COLUMN kb_documents.created_at IS '创建时间（UTC），插入后不可变';
+COMMENT ON COLUMN kb_documents.updated_at IS '最后更新时间（UTC），重入库/归档时刷新';
+```
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | SERIAL | PK | 自增主键，kb_chunks 逻辑外键引用它 |
+| kb_type | TEXT | NOT NULL | 知识类型（见知识类型表 §2.8）：faq / sop / compliance |
+| title | TEXT | NOT NULL | 文档标题，展示与运维定位用 |
+| source_type | TEXT | NOT NULL, DEFAULT 'text' | 来源形态：mail / file / text |
+| source_key | TEXT | NOT NULL, UNIQUE | **来源幂等键**：同来源重入库不产生重复数据 |
+| content_hash | TEXT | NOT NULL | 原文 SHA-256，变更检测：hash 不同才重嵌入 |
+| status | TEXT | NOT NULL, DEFAULT 'active' | active（参与检索）/ archived（归档下线，仅留档） |
+| created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 创建时间（UTC），插入后不可变 |
+| updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 最后更新时间（UTC），随行更新刷新 |
+
+写入方式：先按 `source_key` 查重——不存在则插入，存在且 `content_hash` 不同则更新文档并整篇换块（见 §2.7），hash 相同则跳过（省嵌入调用）。实现：`app/rag/ingest.py` 的 `KnowledgeIngestor`（预检读事务 → 事务外嵌入 → 写事务新建/换块）。
+
+### 2.7 kb_chunks — 知识库分块向量表（RAG 检索单元）
+
+```sql
+CREATE TABLE kb_chunks (
+    id              SERIAL PRIMARY KEY,
+    document_id     INT NOT NULL,
+    kb_type         TEXT NOT NULL,
+    chunk_index     INT NOT NULL,
+    content         TEXT NOT NULL,
+    embedding       vector(1536) NOT NULL,
+    embedding_model TEXT NOT NULL,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (document_id, chunk_index)
+);
+CREATE INDEX idx_kb_chunks_kb_type ON kb_chunks (kb_type);
+
+COMMENT ON TABLE kb_chunks IS '知识库分块向量表（RAG 检索单元）：命中后 content 喂给 LLM';
+COMMENT ON COLUMN kb_chunks.id IS '自增主键';
+COMMENT ON COLUMN kb_chunks.document_id IS '所属文档 ID，逻辑外键 → kb_documents.id（无物理外键约束）；重入库时按它整篇换块';
+COMMENT ON COLUMN kb_chunks.kb_type IS '冗余自文档的 kb_type，检索按类型过滤免 join，取值见「知识类型表」';
+COMMENT ON COLUMN kb_chunks.chunk_index IS '文档内块序号（0 起）；UNIQUE(document_id, chunk_index)，命中后按序还原上下文';
+COMMENT ON COLUMN kb_chunks.content IS '切片原文，检索命中后喂给 LLM 的就是这一列';
+COMMENT ON COLUMN kb_chunks.embedding IS '1536 维向量，维度与 embedding 模型输出绑定（代码常量 KB_EMBEDDING_DIMENSIONS）';
+COMMENT ON COLUMN kb_chunks.embedding_model IS '产出该向量的模型名；不同模型向量不可比，检索强制同模型匹配';
+COMMENT ON COLUMN kb_chunks.metadata IS '块级补充过滤条件，JSONB 对象，示例：{"tags":["pricing"],"audience":"tob"}；热过滤字段（kb_type/status/embedding_model）为显式列，不在此列';
+COMMENT ON COLUMN kb_chunks.created_at IS '入库时间（UTC），插入后不可变';
+```
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | SERIAL | PK | 自增主键 |
+| document_id | INT | NOT NULL，逻辑外键 → kb_documents.id | 所属文档 |
+| kb_type | TEXT | NOT NULL | 冗余自文档，类型过滤免 join（见 §2.8） |
+| chunk_index | INT | NOT NULL, UNIQUE(document_id, chunk_index) | 文档内块序号（0 起），命中后按序还原上下文 |
+| content | TEXT | NOT NULL | 切片原文，检索命中后喂给 LLM |
+| embedding | vector(1536) | NOT NULL | 块向量，维度与 embedding 模型绑定 |
+| embedding_model | TEXT | NOT NULL | 产出向量的模型名，检索强制同模型匹配 |
+| metadata | JSONB | NOT NULL, DEFAULT '{}' | 块级补充过滤条件（tags/audience 等） |
+| created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | 入库时间（UTC），插入后不可变 |
+
+写入方式：重入库时**整篇换块**——先 `DELETE WHERE document_id = :id` 再批量插入新块，同一事务内完成。
+检索方式：`SELECT ... WHERE kb_type = :t AND embedding_model = :m ORDER BY embedding <=> :query LIMIT :k`（余弦距离，仅 active 文档的块参与）。实现：`app/rag/retriever.py` 的 `KnowledgeRetriever`（查询文本先经 embedding 模型向量化，再走 `KbChunkRepository.list_kb_chunk_by_similarity`）。
+向量索引（ivfflat/hnsw）待 M2 embedding 模型与维度定型后再加——M2 已落地 rag 管线（`app/rag/`）与 `LLM_EMBEDDING_MODEL` 配置，真实模型定型后仍单独加索引。
+
+### 2.8 知识类型表（kb types）
+
+> 英文标识是代码中的枚举值（`app/schemas/knowledge.py` 的 `ALL_KB_TYPES`，单一来源），
+> 写入 `kb_documents.kb_type` / `kb_chunks.kb_type` 前按白名单校验。
+> 新增知识类型先扩展代码常量，再同步本表。
+
+| 英文标识 | 中文含义 | 业务用途 |
+|---|---|---|
+| faq | 业务与产品 FAQ | 产品/服务介绍、报价、交付周期、技术问答 → 提供准确业务事实，防止模型杜撰 |
+| sop | 沟通 SOP 与语气 | 商务礼仪（称呼/落款）、场景模板（报价回复/改约/婉拒推销）→ 保持对外沟通专业一致 |
+| compliance | 合规与红线规则 | 不可承诺事项（未批准折扣/未审阅法务条款）、转人工触发词 → 划定安全边界，草稿不越线 |
+
+`kb_documents.kb_type` 与 `kb_chunks.kb_type` 均取本表枚举值；来源形态 `source_type` 白名单（mail / file / text）同样定义在 `app/schemas/knowledge.py`。
+
 ## 3. 设计说明
 
 ### 为什么幂等键是 `(account_id, uid)` 而不是 message_id？
@@ -422,3 +531,44 @@ COMMENT ON COLUMN email_analyses.intent_evidence_source IS '主意图的证据�
 - `intent_evidence_source`：意图分析新增"证据来源"输出，支撑分层视图判定
   （壳层正文 / 转发邮件 / 图片 / 混合），规则见分析图 system prompt。
 - DDL 与字段注释见 §2.3 / §2.4。
+
+### 2026-08-30 新增 RAG 知识库两表：kb_documents / kb_chunks（未接邮件业务）
+
+支撑"回复邮件草稿"的知识库地基（M1 里程碑，仅数据层；与邮件链路零接线）。
+前置启用 pgvector 扩展（需 DB 执行权限）：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE kb_documents (
+    id           SERIAL PRIMARY KEY,
+    kb_type      TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    source_type  TEXT NOT NULL DEFAULT 'text',
+    source_key   TEXT NOT NULL UNIQUE,
+    content_hash TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'active',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE kb_chunks (
+    id              SERIAL PRIMARY KEY,
+    document_id     INT NOT NULL,
+    kb_type         TEXT NOT NULL,
+    chunk_index     INT NOT NULL,
+    content         TEXT NOT NULL,
+    embedding       vector(1536) NOT NULL,
+    embedding_model TEXT NOT NULL,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (document_id, chunk_index)
+);
+CREATE INDEX idx_kb_chunks_kb_type ON kb_chunks (kb_type);
+```
+
+- `kb_documents`：文档级管理语义——`source_key` 幂等重入库、`content_hash` 变更检测、`status` 软下线。
+- `kb_chunks`：检索粒度——1536 维向量 + `embedding_model` 归属（防换模型后向量混空间）；重入库整篇换块。
+- 知识类型白名单（faq / sop / compliance）见 §2.8，代码单一来源 `app/schemas/knowledge.py`。
+- 可执行脚本：`scripts/kb_schema.sql`（建表）、`scripts/kb_seed.sql`（示例数据，占位向量 embedding_model='seed-dummy-1536'）。
+- 向量索引（ivfflat/hnsw）待 M2 embedding 维度定型后再加；ORM/仓储见 `app/db/db.py`（`KbDocument`/`KbChunk`）与 `app/db/repositories.py`。

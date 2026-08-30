@@ -28,6 +28,13 @@ class LLMConfig(BaseSettings):
     # 视觉模型名（识别图片附件用，OpenAI 兼容网关）；未配置则跳过图片识别
     llm_vision_model: str | None = None
 
+    # embedding 模型名（知识库向量化用，同网关 /embeddings 端点）
+    # 未配置时 rag 相关功能抛 LLMConfigurationError，邮件主链路不受影响
+    llm_embedding_model: str | None = None
+    # 仅当网关 embedding 模型支持 dimensions 参数时设置（如 1536）；
+    # 不设则由 rag 层按 KB_EMBEDDING_DIMENSIONS 校验实际返回维度兜底
+    llm_embedding_dimensions: int | None = None
+
 
 class CosConfig(BaseSettings):
     """腾讯云 COS 对象存储配置，由环境变量/.env 驱动。

@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     ARRAY,
+    JSON,
     BigInteger,
     Boolean,
     DateTime,
@@ -29,6 +31,14 @@ from app.schemas.analysis import (
     PRIORITIES,
     SENTIMENTS,
     UNKNOWN_INTENT,
+)
+from app.schemas.knowledge import (
+    ALL_KB_SOURCE_TYPES,
+    ALL_KB_STATUSES,
+    ALL_KB_TYPES,
+    KB_EMBEDDING_DIMENSIONS,
+    KB_SOURCE_TYPE_TEXT,
+    KB_STATUS_ACTIVE,
 )
 
 
@@ -500,3 +510,181 @@ class EmailAnalysis(Base):
         self.translated_subject = translated_subject
         self.translated_text = translated_text
         self.intent_evidence_source = intent_evidence_source
+
+
+# ---------------------------------------------------------------------------
+# 知识库模型（RAG，与邮件链路零接线）
+# ---------------------------------------------------------------------------
+
+_VALID_KB_TYPES = set(ALL_KB_TYPES)
+_VALID_KB_SOURCE_TYPES = set(ALL_KB_SOURCE_TYPES)
+_VALID_KB_STATUSES = set(ALL_KB_STATUSES)
+
+
+class KbDocument(Base):
+    """知识库文档 ORM 模型，对应数据库 kb_documents 表的一行。
+
+    文档级承载管理语义：source_key 幂等重入库、content_hash 变更检测、
+    status 软下线；检索粒度在 KbChunk。与邮件链路无任何外键关联。
+    """
+
+    __tablename__ = "kb_documents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 知识类型：faq / sop / compliance（白名单见 app/schemas/knowledge.py）
+    kb_type: Mapped[str] = mapped_column(String, nullable=False)
+    # 文档标题，展示与运维定位用
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    # 来源形态：mail / file / text
+    source_type: Mapped[str] = mapped_column(String, default=KB_SOURCE_TYPE_TEXT)
+    # 来源幂等键：同来源重入库不产生重复数据
+    source_key: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    # 原文 SHA-256，变更检测：hash 不同才重新分块与嵌入
+    content_hash: Mapped[str] = mapped_column(String, nullable=False)
+    # 知识状态：active（参与检索）/ archived（归档下线）
+    status: Mapped[str] = mapped_column(String, default=KB_STATUS_ACTIVE)
+    # 创建时间
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc, nullable=False
+    )
+    # 最后更新时间，重入库/归档时刷新
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc, onupdate=_now_utc, nullable=False
+    )
+
+    def __init__(
+        self,
+        *,
+        id: int | None = None,
+        kb_type: str,
+        title: str,
+        source_key: str,
+        content_hash: str,
+        source_type: str = "text",
+        status: str = KB_STATUS_ACTIVE,
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
+    ) -> None:
+        """构造后校验：白名单字段必须合法，标识字段非空。"""
+        if kb_type not in _VALID_KB_TYPES:
+            msg = f"kb_type must be one of {sorted(_VALID_KB_TYPES)}, got {kb_type!r}"
+            raise ValueError(msg)
+        if not isinstance(title, str) or not title:
+            msg = f"title must be non-empty str, got {title!r}"
+            raise ValueError(msg)
+        if source_type not in _VALID_KB_SOURCE_TYPES:
+            msg = (
+                f"source_type must be one of {sorted(_VALID_KB_SOURCE_TYPES)}, got {source_type!r}"
+            )
+            raise ValueError(msg)
+        if not isinstance(source_key, str) or not source_key:
+            msg = f"source_key must be non-empty str, got {source_key!r}"
+            raise ValueError(msg)
+        if not isinstance(content_hash, str) or not content_hash:
+            msg = f"content_hash must be non-empty str, got {content_hash!r}"
+            raise ValueError(msg)
+        if status not in _VALID_KB_STATUSES:
+            msg = f"status must be one of {sorted(_VALID_KB_STATUSES)}, got {status!r}"
+            raise ValueError(msg)
+
+        self.id = id  # type: ignore[assignment]
+        self.kb_type = kb_type
+        self.title = title
+        self.source_type = source_type
+        self.source_key = source_key
+        self.content_hash = content_hash
+        self.status = status
+        if created_at is not None:
+            self.created_at = created_at
+        if updated_at is not None:
+            self.updated_at = updated_at
+
+
+class KbChunk(Base):
+    """知识库分块 ORM 模型，对应数据库 kb_chunks 表的一行。
+
+    检索粒度：content 是命中后喂给 LLM 的原文，embedding 是其向量。
+    kb_type 冗余自所属文档，类型过滤免 join；重入库时按 document_id 整篇换块。
+    """
+
+    __tablename__ = "kb_chunks"
+    # (document_id, chunk_index) 唯一：块在文档内有序且不重复，可按序还原上下文
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id", "chunk_index", name="kb_chunks_document_id_chunk_index_key"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 所属文档 ID，逻辑外键 → kb_documents.id（无物理外键约束）
+    document_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 冗余自文档的 kb_type，检索按类型过滤免 join
+    kb_type: Mapped[str] = mapped_column(String, nullable=False)
+    # 文档内块序号（0 起）
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 切片原文，检索命中后喂给 LLM 的就是这一列
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # 块向量：PG 上为 pgvector 定长列；sqlite 单测经 with_variant 退化为 JSON 列
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(KB_EMBEDDING_DIMENSIONS).with_variant(JSON(), "sqlite"), nullable=False
+    )
+    # 产出该向量的模型名：不同模型向量不可比，检索强制同模型匹配
+    embedding_model: Mapped[str] = mapped_column(String, nullable=False)
+    # 块级补充过滤条件；metadata 是 SQLAlchemy Declarative 保留属性名，属性改用 meta
+    meta: Mapped[dict] = mapped_column(
+        "metadata", JSONB().with_variant(JSON(), "sqlite"), default=dict
+    )
+    # 入库时间
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now_utc, nullable=False
+    )
+
+    def __init__(
+        self,
+        *,
+        id: int | None = None,
+        document_id: int,
+        kb_type: str,
+        chunk_index: int,
+        content: str,
+        embedding: list[float],
+        embedding_model: str,
+        meta: dict | None = None,
+        created_at: datetime | None = None,
+    ) -> None:
+        """构造后校验：向量维度必须与列定义一致，白名单字段必须合法。"""
+        if not isinstance(document_id, int) or document_id <= 0:
+            msg = f"document_id must be positive int, got {document_id!r}"
+            raise ValueError(msg)
+        if kb_type not in _VALID_KB_TYPES:
+            msg = f"kb_type must be one of {sorted(_VALID_KB_TYPES)}, got {kb_type!r}"
+            raise ValueError(msg)
+        if not isinstance(chunk_index, int) or chunk_index < 0:
+            msg = f"chunk_index must be int >=0, got {chunk_index!r}"
+            raise ValueError(msg)
+        if not isinstance(content, str) or not content:
+            msg = f"content must be non-empty str, got {content!r}"
+            raise ValueError(msg)
+        if not isinstance(embedding, list) or len(embedding) != KB_EMBEDDING_DIMENSIONS:
+            msg = (
+                f"embedding must be list of {KB_EMBEDDING_DIMENSIONS} floats, "
+                f"got length {len(embedding) if isinstance(embedding, list) else embedding!r}"
+            )
+            raise ValueError(msg)
+        if not all(isinstance(x, (int, float)) for x in embedding):
+            msg = "embedding must contain only numbers"
+            raise ValueError(msg)
+        if not isinstance(embedding_model, str) or not embedding_model:
+            msg = f"embedding_model must be non-empty str, got {embedding_model!r}"
+            raise ValueError(msg)
+
+        self.id = id  # type: ignore[assignment]
+        self.document_id = document_id
+        self.kb_type = kb_type
+        self.chunk_index = chunk_index
+        self.content = content
+        self.embedding = embedding
+        self.embedding_model = embedding_model
+        self.meta = meta if meta is not None else {}
+        if created_at is not None:
+            self.created_at = created_at

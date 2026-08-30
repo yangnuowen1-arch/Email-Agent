@@ -12,6 +12,9 @@ from app.observability import configure_logging
 from app.providers.email.base import AccountConfig, MailClient
 from app.providers.email.factory import create_client
 from app.providers.storage import CosAttachmentStorage
+from app.rag.embedding import build_knowledge_embedder
+from app.rag.ingest import KnowledgeIngestor
+from app.rag.retriever import KnowledgeRetriever
 from app.services.email import EmailService
 
 
@@ -95,6 +98,26 @@ class Container:
     def email_coordinator(self) -> EmailCoordinator:
         """返回邮件智能体编排器。"""
         return self._email_coordinator
+
+    @property
+    def knowledge_ingestor(self) -> KnowledgeIngestor:
+        """构造知识库入库器（按需新建，不缓存）。
+
+        需配置 ``LLM_EMBEDDING_MODEL``，缺失时抛 LLMConfigurationError；
+        embedder 为轻量无连接对象，访问时新建不引入全局状态。
+        """
+        return KnowledgeIngestor(
+            embedder=build_knowledge_embedder(self._config.llm),
+            database=self._database,
+        )
+
+    @property
+    def knowledge_retriever(self) -> KnowledgeRetriever:
+        """构造知识库检索器（按需新建，不缓存），配置要求同 ``knowledge_ingestor``。"""
+        return KnowledgeRetriever(
+            embedder=build_knowledge_embedder(self._config.llm),
+            database=self._database,
+        )
 
     @property
     def logger(self):

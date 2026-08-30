@@ -1,11 +1,11 @@
-"""LLM 工厂：按配置构建 langchain-openai ChatOpenAI 实例。"""
+"""LLM 工厂：按配置构建 langchain-openai ChatOpenAI / OpenAIEmbeddings 实例。"""
 
 from __future__ import annotations
 
 import httpx
 import structlog
 from langchain_core.rate_limiters import InMemoryRateLimiter
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 from app.core.settings import LLMConfig
 from app.llm.errors import LLMConfigurationError
@@ -77,4 +77,37 @@ def build_chat_model(llm_config: LLMConfig, *, model: str | None = None) -> Chat
         max_retries=3,
         http_async_client=async_client,
         rate_limiter=rate_limiter,
+    )
+
+
+def build_embedding_model(llm_config: LLMConfig, *, model: str | None = None) -> OpenAIEmbeddings:
+    """按 LLMConfig 构建 OpenAIEmbeddings，走同网关的 /embeddings 端点。
+
+    ``model`` 用于覆盖配置中的 embedding 模型名；为 None 时使用
+    ``llm_config.llm_embedding_model``。
+
+    Raises LLMConfigurationError when no API key or no embedding model is configured.
+    """
+    if not llm_config.llm_api_key:
+        raise LLMConfigurationError(
+            f"No API key configured for LLM provider '{llm_config.llm_provider}'"
+        )
+    embedding_model = model or llm_config.llm_embedding_model
+    if not embedding_model:
+        msg = (
+            "No embedding model configured; set LLM_EMBEDDING_MODEL in environment "
+            "or .env (see .env.example)"
+        )
+        raise LLMConfigurationError(msg)
+
+    # check_embedding_ctx_length=False：第三方 OpenAI 兼容网关普遍不认本地
+    # tiktoken 分词出的 token 数组，关掉后直接发送原文，由网关自行处理长度
+    return OpenAIEmbeddings(
+        model=embedding_model,
+        api_key=llm_config.llm_api_key,
+        base_url=llm_config.llm_base_url,
+        timeout=llm_config.llm_timeout_seconds,
+        max_retries=3,
+        dimensions=llm_config.llm_embedding_dimensions,
+        check_embedding_ctx_length=False,
     )

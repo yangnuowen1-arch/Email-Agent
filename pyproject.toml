@@ -16,6 +16,7 @@ dependencies = [
     "langchain-openai>=0.3",
     "beautifulsoup4>=4.12",
     "cos-python-sdk-v5>=1.9",
+    "pgvector>=0.3",
 ]
 
 [project.optional-dependencies]

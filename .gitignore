@@ -232,3 +232,5 @@ opencode.json.DS_Store
 opencode.json
 .vscode
 AGENTS.md
+# ZCode 会话目录
+.zcode/

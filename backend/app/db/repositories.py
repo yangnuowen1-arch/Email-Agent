@@ -13,8 +13,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas import ParsedEmail
+from app.schemas.knowledge import ALL_KB_TYPES, KB_EMBEDDING_DIMENSIONS, KB_STATUS_ACTIVE
 
-from .db import Account, EmailAnalysis, EmailAttachment, EmailMessage
+from .db import Account, EmailAnalysis, EmailAttachment, EmailMessage, KbChunk, KbDocument
 
 
 class EmailAccountRepository:
@@ -438,3 +439,218 @@ class EmailAnalysisRepository:
 
         stmt = update(EmailAnalysis).where(EmailAnalysis.id == analysis_id).values(**values)
         await self.session.execute(stmt)
+
+
+# ---------------------------------------------------------------------------
+# 知识库 Repository（RAG，与邮件链路零接线）
+# ---------------------------------------------------------------------------
+
+
+def _validate_kb_type(kb_type: str) -> None:
+    """kb_type 白名单校验：非法值在仓储入口即失败，不落库。"""
+    if kb_type not in ALL_KB_TYPES:
+        msg = f"kb_type must be one of {sorted(ALL_KB_TYPES)}, got {kb_type!r}"
+        raise ValueError(msg)
+
+
+def _build_similarity_stmt(
+    kb_type: str,
+    query_embedding: list[float],
+    *,
+    top_k: int,
+    embedding_model: str | None = None,
+):
+    """构造余弦相似度检索语句（纯函数，便于单测检验过滤与排序封装）。
+
+    过滤：kb_type 精确匹配 + 所属文档 status=active（归档知识不参与检索）
+    + 可选 embedding_model 匹配；排序：余弦距离升序，取前 top_k 条。
+    """
+    distance = KbChunk.embedding.cosine_distance(query_embedding)
+    stmt = (
+        select(KbChunk, distance)
+        .where(
+            KbChunk.kb_type == kb_type,
+            # 检索只取 active 文档的块：归档下线的知识不再命中
+            KbChunk.document_id.in_(
+                select(KbDocument.id).where(KbDocument.status == KB_STATUS_ACTIVE)
+            ),
+        )
+        .order_by(distance)
+        .limit(top_k)
+    )
+    if embedding_model is not None:
+        stmt = stmt.where(KbChunk.embedding_model == embedding_model)
+    return stmt
+
+
+class KbDocumentRepository:
+    """kb_documents 表的异步访问入口。"""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def get_kb_document_by_id(self, document_id: int) -> KbDocument | None:
+        """按主键查询单个知识文档。"""
+        return await self.session.get(KbDocument, document_id)
+
+    async def get_kb_document_by_source_key(self, source_key: str) -> KbDocument | None:
+        """按来源幂等键查询：重入库时先查它决定 insert / update / skip。"""
+        stmt = select(KbDocument).where(KbDocument.source_key == source_key)
+        return await self.session.scalar(stmt)
+
+    async def list_kb_document_by_kb_type(
+        self, kb_type: str, *, active_only: bool = False
+    ) -> list[KbDocument]:
+        """按知识类型查询文档列表，默认返回全部；active_only=True 时仅返回生效文档。"""
+        _validate_kb_type(kb_type)
+
+        stmt = select(KbDocument).where(KbDocument.kb_type == kb_type).order_by(KbDocument.id)
+        if active_only:
+            stmt = stmt.where(KbDocument.status == KB_STATUS_ACTIVE)
+
+        result = await self.session.scalars(stmt)
+        return list(result.all())
+
+    async def create_kb_document(self, entity: KbDocument) -> KbDocument:
+        """插入单个知识文档，flush 后返回带主键的实体。"""
+        if not isinstance(entity, KbDocument):
+            msg = f"expected KbDocument, got {type(entity).__name__}"
+            raise TypeError(msg)
+
+        self.session.add(entity)
+        await self.session.flush()
+        return entity
+
+    async def update_kb_document_by_id(
+        self,
+        document_id: int,
+        *,
+        title: str | None = None,
+        content_hash: str | None = None,
+        status: str | None = None,
+    ) -> bool:
+        """按主键更新文档的可变字段（重入库改 hash、归档改 status），返回是否命中。
+
+        仅更新显式传入的字段；updated_at 随行刷新，与既有仓储的更新方法一致。
+        """
+        values: dict = {"updated_at": datetime.now(UTC)}
+        if title is not None:
+            if not title:
+                msg = "title must be non-empty when provided"
+                raise ValueError(msg)
+            values["title"] = title
+        if content_hash is not None:
+            if not content_hash:
+                msg = "content_hash must be non-empty when provided"
+                raise ValueError(msg)
+            values["content_hash"] = content_hash
+        if status is not None:
+            if status not in {"active", "archived"}:
+                msg = f"status must be one of ['active', 'archived'], got {status!r}"
+                raise ValueError(msg)
+            values["status"] = status
+
+        stmt = update(KbDocument).where(KbDocument.id == document_id).values(**values)
+        result = await self.session.execute(stmt)
+        return bool(result.rowcount)
+
+    async def delete_kb_document_by_id(self, document_id: int) -> bool:
+        """按主键删除文档，返回是否删除成功。
+
+        块表无物理级联（与既有表一致的逻辑外键约定），删除文档前由调用方
+        先经 ``KbChunkRepository.delete_kb_chunk_by_document_id`` 清块。
+        """
+        stmt = delete(KbDocument).where(KbDocument.id == document_id)
+        result = await self.session.execute(stmt)
+        return bool(result.rowcount)
+
+
+class KbChunkRepository:
+    """kb_chunks 表的异步访问入口。"""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def get_kb_chunk_by_id(self, chunk_id: int) -> KbChunk | None:
+        """按主键查询单个分块。"""
+        return await self.session.get(KbChunk, chunk_id)
+
+    async def list_kb_chunk_by_document_id(self, document_id: int) -> list[KbChunk]:
+        """按所属文档查询分块列表，按 chunk_index 排序（可按序还原上下文）。"""
+        stmt = (
+            select(KbChunk).where(KbChunk.document_id == document_id).order_by(KbChunk.chunk_index)
+        )
+        result = await self.session.scalars(stmt)
+        return list(result.all())
+
+    async def create_kb_chunk(self, entity: KbChunk) -> KbChunk:
+        """插入单个分块，flush 后返回带主键的实体。"""
+        if not isinstance(entity, KbChunk):
+            msg = f"expected KbChunk, got {type(entity).__name__}"
+            raise TypeError(msg)
+
+        self.session.add(entity)
+        await self.session.flush()
+        return entity
+
+    async def bulk_create_kb_chunk(self, entities: list[KbChunk]) -> list[KbChunk]:
+        """批量插入分块（整篇换块的新块写入），flush 后按序返回带主键的实体列表。
+
+        ORM add_all + 一次 flush：单事务批量落库，且 sqlite 单测可正常执行。
+        """
+        for entity in entities:
+            if not isinstance(entity, KbChunk):
+                msg = f"expected KbChunk, got {type(entity).__name__}"
+                raise TypeError(msg)
+
+        self.session.add_all(entities)
+        await self.session.flush()
+        return list(entities)
+
+    async def delete_kb_chunk_by_document_id(self, document_id: int) -> int:
+        """删除文档下的全部分块（整篇换块第一步），返回删除条数。"""
+        stmt = delete(KbChunk).where(KbChunk.document_id == document_id)
+        result = await self.session.execute(stmt)
+        return result.rowcount
+
+    async def list_kb_chunk_by_similarity(
+        self,
+        kb_type: str,
+        query_embedding: list[float],
+        *,
+        top_k: int = 5,
+        embedding_model: str | None = None,
+    ) -> list[tuple[KbChunk, float]]:
+        """按余弦距离检索某知识类型下最相近的 top_k 个分块。
+
+        过滤条件：kb_type 精确匹配 + 所属文档 status=active（归档知识不参与检索）
+        + 可选 embedding_model 匹配（不同模型的向量不可比，生产检索必须传）。
+        返回 (分块, 余弦距离) 列表，按距离升序；距离越小越相似。
+        """
+        _validate_kb_type(kb_type)
+        if not isinstance(top_k, int) or top_k <= 0:
+            msg = f"top_k must be positive int, got {top_k!r}"
+            raise ValueError(msg)
+        if (
+            not isinstance(query_embedding, list)
+            or len(query_embedding) != KB_EMBEDDING_DIMENSIONS
+            or not all(isinstance(x, (int, float)) for x in query_embedding)
+        ):
+            got = (
+                len(query_embedding) if isinstance(query_embedding, list) else repr(query_embedding)
+            )
+            msg = (
+                f"query_embedding must be list of {KB_EMBEDDING_DIMENSIONS} floats, "
+                f"got length {got}"
+            )
+            raise ValueError(msg)
+
+        stmt = _build_similarity_stmt(
+            kb_type,
+            query_embedding,
+            top_k=top_k,
+            embedding_model=embedding_model,
+        )
+
+        rows = await self.session.execute(stmt)
+        return [(chunk, float(dist)) for chunk, dist in rows.all()]
