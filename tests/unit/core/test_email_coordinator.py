@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import structlog
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
+from structlog.testing import capture_logs
 
 from app.core.email_coordinator import EmailCoordinator
 from app.core.settings import AppConfig, LLMConfig
@@ -110,3 +113,36 @@ async def test_load_compliance_rules_degrades_on_db_error():
     coordinator = _make_coordinator(_BrokenDatabase())
 
     assert await coordinator._load_compliance_rules() == []
+
+
+async def test_save_draft_skip_logs_retrieval_evidence(kb_database):
+    """草稿降级路径不触 DB：draft_skipped 日志带检索命中数与最近距离，无命中为 None。"""
+    coordinator = _make_coordinator(kb_database)
+    email = SimpleNamespace(id=1)
+
+    with capture_logs() as cap:
+        await coordinator._save_draft(
+            email,
+            {
+                "draft_skipped_reason": "no_relevant_knowledge",
+                "retrieval_query": "测试邮件",
+                "retrieved_chunks": [
+                    {"document_id": 1, "distance": 0.9},
+                    {"document_id": 2, "distance": 0.5},
+                ],
+            },
+        )
+
+    log = next(e for e in cap if e["event"] == "draft_skipped")
+    assert log["retrieved_count"] == 2
+    assert log["top_distance"] == 0.5
+
+    with capture_logs() as cap:
+        await coordinator._save_draft(
+            email,
+            {"draft_skipped_reason": "retrieval_failed", "retrieved_chunks": []},
+        )
+
+    log = next(e for e in cap if e["event"] == "draft_skipped")
+    assert log["retrieved_count"] == 0
+    assert log["top_distance"] is None

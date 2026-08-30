@@ -50,9 +50,21 @@
 - 草稿节点产出：`draft_category, draft_subject, draft_body, draft_sources,
   draft_model`（sources 每项含 `document_id / title / distance / snippet`）；
   降级路径只出 `draft_skipped_reason`
+- 检索观测证据：草稿节点检索发生即写 `retrieval_query`（实际执行的 query）与
+  `retrieved_chunks`（原始命中，每项 `document_id / title / distance / content`，
+  content 截 `DRAFT_CHUNK_SNIPPET_CHARS`）——含无相关知识 / 生成失败路径；
+  检索前早退（`intent_category_mismatch` / `empty_query`）两键缺席。
+  仅入 state 供调用方日志排查"为什么没出草稿"，不落库（落库核对依据仍是
+  `draft_sources`）
+- 枚举即文档：`primary_intent / sentiment / priority / intent_evidence_source /
+  draft_category / draft_skipped_reason` 在 state 注解上收紧为 schemas 层
+  Literal（白名单单一来源在 `app/schemas/`，如 `DRAFT_SKIPPED_REASON_LITERAL`）
 - 错误不经 state 传递：analyze/translate 节点抛 `LLMInvocationError`
   （`app/agent/errors.py`），由 coordinator `except AnalysisGraphError` 捕获后
   落库 `status="failed"`；草稿节点不抛错，降级原因走 state
+- token 消耗也不经 state：`GraphTraceHandler.usage_summary()` 聚合一次运行内
+  全部 LLM 调用的 usage（`app/agent/trace_handle.py`），coordinator 取用后
+  放进 `analyze_email` 返回值与日志
 
 ### 构建方式
 ```python

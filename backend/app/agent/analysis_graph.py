@@ -16,6 +16,11 @@ detect_and_translate 节点（检测语言并翻译为中文，译文仅落库�
 ``intent_evidence_source``（意图证据来源）。本图自身不触 DB；唯一的外部 IO
 是草稿节点经闭包注入的 KnowledgeRetriever（向量检索）。
 
+检索观测数据流：草稿节点检索发生即把实际执行的 query 与原始命中写入
+``retrieval_query`` / ``retrieved_chunks``（含质量门槛未通过、生成失败路径），
+仅供调用方日志排查"为什么没出草稿"，不落库——落库的核对依据仍是
+``draft_sources``；检索前早退（意图类别不匹配 / 空 query）两键缺席。
+
 构建方式：
     graph = build_email_analysis_graph(chat_model, vision_model=None, knowledge_retriever=None)
     result = await graph.ainvoke(initial_state)
@@ -55,6 +60,7 @@ from pydantic import ValidationError
 
 from app.agent.constants import (
     ANALYSIS_MAX_BODY_CHARS,
+    DRAFT_CHUNK_SNIPPET_CHARS,
     DRAFT_COMPLIANCE_MAX_CHARS,
     DRAFT_MAX_COSINE_DISTANCE,
     DRAFT_QUERY_MAX_CHARS,
@@ -75,6 +81,10 @@ from app.agent.prompts import (
     EMAIL_TRANSLATE_SYSTEM_PROMPT,
 )
 from app.schemas.analysis import (
+    EVIDENCE_SOURCE_LITERAL,
+    INTENT_LITERAL,
+    PRIORITY_LITERAL,
+    SENTIMENT_LITERAL,
     TRANSLATION_EXCLUDED_INTENTS,
     EmailAnalysisOutput,
     EmailTranslationOutput,
@@ -82,7 +92,14 @@ from app.schemas.analysis import (
 from app.schemas.draft import (
     DRAFT_CATEGORY_AFTER_SALE,
     DRAFT_CATEGORY_BY_INTENT,
+    DRAFT_CATEGORY_LITERAL,
     DRAFT_CATEGORY_PRE_SALE,
+    DRAFT_SKIP_EMPTY_QUERY,
+    DRAFT_SKIP_GENERATION_FAILED,
+    DRAFT_SKIP_INTENT_MISMATCH,
+    DRAFT_SKIP_NO_KNOWLEDGE,
+    DRAFT_SKIP_RETRIEVAL_FAILED,
+    DRAFT_SKIPPED_REASON_LITERAL,
     EmailDraftOutput,
 )
 from app.schemas.knowledge import KB_TYPE_FAQ, KB_TYPE_SOP
@@ -122,31 +139,37 @@ class EmailAnalysisState(TypedDict, total=False):
     # analyze 节点附件提取产出
     attachment_views: list[dict]  # 分层视图段 [{"kind", "filename", "text"}]
     extracted_cache: list[dict]  # [{"attachment_id", "extracted_text"}]，coordinator 写回缓存
-    intent_evidence_source: str
+    intent_evidence_source: EVIDENCE_SOURCE_LITERAL
 
     # detect_and_translate 节点产出（译文仅落库展示，不回灌 analyze）
     source_language: str
     translated_subject: str
     translated_text: str
 
-    # analyze 节点产出
-    primary_intent: str
+    # analyze 节点产出（枚举字段白名单单一来源在 app/schemas/）
+    primary_intent: INTENT_LITERAL
     intents: list[dict]
     reasoning_summary: str
     entities: dict
-    sentiment: str
-    priority: str
+    sentiment: SENTIMENT_LITERAL
+    priority: PRIORITY_LITERAL
     suggested_tools: list[str]
     llm_model: str
 
     # 草稿节点产出（draft_presale / draft_aftersale，coordinator 落 email_drafts）
-    draft_category: str
+    draft_category: DRAFT_CATEGORY_LITERAL
     draft_subject: str
     draft_body: str
     draft_sources: list[dict]  # [{"document_id", "title", "distance", "snippet"}]，人工核对依据
     draft_model: str
-    # 草稿降级原因：no_relevant_knowledge / retrieval_failed / generation_failed 等
-    draft_skipped_reason: str
+    # 草稿降级原因（白名单见 DRAFT_SKIPPED_REASON_LITERAL）
+    draft_skipped_reason: DRAFT_SKIPPED_REASON_LITERAL
+
+    # 检索观测证据：实际执行的 query 与原始命中（质量门槛判断前即可观测）。
+    # 仅入 state 供调用方日志排查"为什么没出草稿"，不落库——落库的核对依据
+    # 仍是 draft_sources；检索前早退（意图类别不匹配 / 空 query）两键缺席
+    retrieval_query: str
+    retrieved_chunks: list[dict]  # [{"document_id", "title", "distance", "content"}]
 
 
 async def _extract_attachment_views(
@@ -366,6 +389,19 @@ def _route_after_translation(state: EmailAnalysisState, *, has_retriever: bool) 
     return END
 
 
+def _retrieval_evidence(chunks: list[Any]) -> list[dict]:
+    """把检索命中压缩为 state 观测证据（content 截断，distance 保留 4 位）。"""
+    return [
+        {
+            "document_id": chunk.document_id,
+            "title": chunk.document_title,
+            "distance": round(chunk.distance, 4),
+            "content": chunk.content[:DRAFT_CHUNK_SNIPPET_CHARS],
+        }
+        for chunk in chunks
+    ]
+
+
 async def _draft_node(
     state: EmailAnalysisState,
     # langgraph 按注解字面匹配来注入 config，仅认 RunnableConfig/Optional[RunnableConfig]，
@@ -387,6 +423,10 @@ async def _draft_node(
     + 知识摘录 + 分层视图 + 客户语言拼 prompt → 单次 LLM 结构化调用产出
     subject/body。
 
+    检索发生即写观测证据：检索成功后的所有返回路径（含无相关知识、生成失败、
+    成功）都带 ``retrieval_query`` 与 ``retrieved_chunks``，调用方可据此在日志
+    侧定位"为什么没出草稿"；检索前早退路径两键缺席。
+
     草稿是意向分析的附加产物：本节点不挂 RetryPolicy、内部捕获全部异常降级为
     ``draft_skipped_reason``，保证任何草稿失败都不影响已完成的意向分析落库。
     检索失败（非 LLM 的网络 IO，handler 覆盖不到）由节点记一条 warning；
@@ -394,13 +434,13 @@ async def _draft_node(
     """
     primary = state.get("primary_intent") or ""
     if DRAFT_CATEGORY_BY_INTENT.get(primary) != category:
-        return {"draft_skipped_reason": "intent_category_mismatch"}
+        return {"draft_skipped_reason": DRAFT_SKIP_INTENT_MISMATCH}
 
     subject = state.get("subject", "")
     cleaned = state.get("cleaned_text", "")
     query = f"{subject}\n{cleaned}".strip()[:DRAFT_QUERY_MAX_CHARS]
     if not query:
-        return {"draft_skipped_reason": "empty_query"}
+        return {"draft_skipped_reason": DRAFT_SKIP_EMPTY_QUERY}
 
     try:
         chunks = await retriever.retrieve(kb_type, query, top_k=DRAFT_RETRIEVAL_TOP_K)
@@ -411,10 +451,18 @@ async def _draft_node(
             kb_type=kb_type,
             error=f"{type(exc).__name__}: {exc}"[:300],
         )
-        return {"draft_skipped_reason": "retrieval_failed"}
+        return {
+            "draft_skipped_reason": DRAFT_SKIP_RETRIEVAL_FAILED,
+            "retrieval_query": query,
+            "retrieved_chunks": [],
+        }
 
     if not chunks or min(chunk.distance for chunk in chunks) > DRAFT_MAX_COSINE_DISTANCE:
-        return {"draft_skipped_reason": "no_relevant_knowledge"}
+        return {
+            "draft_skipped_reason": DRAFT_SKIP_NO_KNOWLEDGE,
+            "retrieval_query": query,
+            "retrieved_chunks": _retrieval_evidence(chunks),
+        }
 
     knowledge_block = "\n\n".join(
         f"[document_id={chunk.document_id} title={chunk.document_title} "
@@ -467,10 +515,18 @@ async def _draft_node(
         )
     except Exception:  # noqa: BLE001
         # LLM 超时/网络/解析失败均降级；具体错误已由 GraphTraceHandler 记录
-        return {"draft_skipped_reason": "generation_failed"}
+        return {
+            "draft_skipped_reason": DRAFT_SKIP_GENERATION_FAILED,
+            "retrieval_query": query,
+            "retrieved_chunks": _retrieval_evidence(chunks),
+        }
 
     if result is None:
-        return {"draft_skipped_reason": "generation_failed"}
+        return {
+            "draft_skipped_reason": DRAFT_SKIP_GENERATION_FAILED,
+            "retrieval_query": query,
+            "retrieved_chunks": _retrieval_evidence(chunks),
+        }
 
     return {
         "draft_category": category,
@@ -486,6 +542,8 @@ async def _draft_node(
             for chunk in chunks
         ],
         "draft_model": getattr(chat_model, "model_name", "unknown"),
+        "retrieval_query": query,
+        "retrieved_chunks": _retrieval_evidence(chunks),
     }
 
 

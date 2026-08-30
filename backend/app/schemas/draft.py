@@ -59,6 +59,30 @@ ALL_DRAFT_STATUSES: tuple[str, ...] = (
 DRAFT_STATUS_LITERAL = Literal["pending", "approved", "rejected"]
 
 # ---------------------------------------------------------------------------
+# 草稿降级原因（draft_skipped_reason 白名单，图内降级路径唯一出处）
+# ---------------------------------------------------------------------------
+
+#: 意图与节点类别不匹配（路由错配防御，检索前早退）
+DRAFT_SKIP_INTENT_MISMATCH = "intent_category_mismatch"
+#: 主题与正文均为空，无检索 query 可组（检索前早退）
+DRAFT_SKIP_EMPTY_QUERY = "empty_query"
+#: 知识库向量检索失败（embedding 网关不可用等非 LLM IO）
+DRAFT_SKIP_RETRIEVAL_FAILED = "retrieval_failed"
+#: 无命中或最近余弦距离超 DRAFT_MAX_COSINE_DISTANCE，视为无相关知识
+DRAFT_SKIP_NO_KNOWLEDGE = "no_relevant_knowledge"
+#: LLM 起草失败（超时/网络/解析失败/返回 None）
+DRAFT_SKIP_GENERATION_FAILED = "generation_failed"
+
+#: 草稿降级原因 Literal（state 注解与测试断言依据）
+DRAFT_SKIPPED_REASON_LITERAL = Literal[
+    "intent_category_mismatch",
+    "empty_query",
+    "retrieval_failed",
+    "no_relevant_knowledge",
+    "generation_failed",
+]
+
+# ---------------------------------------------------------------------------
 # 意图 → 草稿分支映射（路由唯一出处）
 # ---------------------------------------------------------------------------
 

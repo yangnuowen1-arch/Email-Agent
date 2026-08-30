@@ -137,8 +137,14 @@ class EmailCoordinator:
         if not (draft_subject and draft_body and draft_category):
             reason = result.get("draft_skipped_reason")
             if reason:
+                evidence = result.get("retrieved_chunks") or []
                 self._logger.info(
-                    "draft_skipped", email_id=email.id, category=draft_category, reason=reason
+                    "draft_skipped",
+                    email_id=email.id,
+                    category=draft_category,
+                    reason=reason,
+                    retrieved_count=len(evidence),
+                    top_distance=min((c["distance"] for c in evidence), default=None),
                 )
             return None
 
@@ -265,6 +271,8 @@ class EmailCoordinator:
                 "priority": result.get("priority", "P2"),
                 "intent_evidence_source": result.get("intent_evidence_source", EVIDENCE_BODY),
                 "draft": draft,
+                # 单封邮件全部 LLM 调用（analyze/翻译/草稿）的 token 汇总；全失败为 None
+                "usage": trace.usage_summary(),
                 "error": str(error_info) if error_info is not None else None,
                 "error_type": type(error_info).__name__ if error_info is not None else None,
             }
@@ -292,6 +300,7 @@ class EmailCoordinator:
                     intent=outcome.get("primary_intent"),
                     priority=outcome.get("priority"),
                     analysis_id=outcome.get("analysis_id"),
+                    total_tokens=(outcome.get("usage") or {}).get("total_tokens"),
                 )
 
             except Exception as exc:  # noqa: BLE001

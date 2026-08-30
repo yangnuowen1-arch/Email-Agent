@@ -45,5 +45,8 @@ DRAFT_RETRIEVAL_TOP_K: int = 4
 DRAFT_MAX_COSINE_DISTANCE: float = 0.8
 #: 检索 query 截断长度（主题 + 正文拼接后截断）
 DRAFT_QUERY_MAX_CHARS: int = 500
+#: state 检索证据（retrieved_chunks）的 content 截断长度；与落库 draft_sources 的
+#: snippet（200 字）分开：证据供日志排查"为什么没出草稿"，保留更多上下文
+DRAFT_CHUNK_SNIPPET_CHARS: int = 500
 #: 草稿 prompt 注入红线规则的总字符预算（整条规则为单位，放不下整条就舍弃其后全部）
 DRAFT_COMPLIANCE_MAX_CHARS: int = 2000

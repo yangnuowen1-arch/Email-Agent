@@ -24,6 +24,7 @@ from app.agent.analysis_graph import (
     build_email_analysis_graph,
 )
 from app.agent.constants import (
+    DRAFT_CHUNK_SNIPPET_CHARS,
     DRAFT_COMPLIANCE_MAX_CHARS,
     DRAFT_MAX_COSINE_DISTANCE,
     DRAFT_RETRIEVAL_TOP_K,
@@ -389,6 +390,32 @@ def test_trace_handler_dump_returns_copy() -> None:
     events = handler.dump()
     events.clear()
     assert handler.dump()  # dump 是副本，外部修改不影响内部状态
+
+
+def test_trace_handler_usage_summary_aggregates_all_llm_calls() -> None:
+    """usage_summary 聚合全部 llm_end 事件的 usage（analyze/翻译/草稿求和）。"""
+    handler = GraphTraceHandler()
+    for _ in range(2):
+        run_id = uuid4()
+        handler.on_chat_model_start(None, [], run_id=run_id, name="fake-model")
+        handler.on_llm_end(_FakeResponse(), run_id=run_id)
+
+    assert handler.usage_summary() == {
+        "llm_calls": 2,
+        "input_tokens": 20,
+        "output_tokens": 10,
+        "total_tokens": 30,
+    }
+
+
+def test_trace_handler_usage_summary_none_without_llm_calls() -> None:
+    """无成功的 LLM 调用（如仅 chain/llm_error 事件）→ 返回 None。"""
+    handler = GraphTraceHandler()
+    run_id = uuid4()
+    handler.on_chain_start(None, {}, run_id=run_id, name="analyze")
+    handler.on_llm_error(RuntimeError("boom"), run_id=run_id)
+
+    assert handler.usage_summary() is None
 
 
 async def test_compiled_graph_captures_trace_events() -> None:
@@ -770,6 +797,22 @@ async def test_draft_node_generates_draft_from_relevant_knowledge() -> None:
             "snippet": "运费说明：非质量问题退货运费由买家承担。",
         },
     ]
+    # 检索观测证据：实际执行的 query 与原始命中进入 state
+    assert result["retrieval_query"] == "测试邮件\n请帮我取消订单 ORD-123"
+    assert result["retrieved_chunks"] == [
+        {
+            "document_id": 11,
+            "title": "售后政策手册",
+            "distance": 0.2,
+            "content": "退货政策：签收后 7 天内可无理由退货。",
+        },
+        {
+            "document_id": 12,
+            "title": "运费规则",
+            "distance": 0.4,
+            "content": "运费说明：非质量问题退货运费由买家承担。",
+        },
+    ]
     # 检索参数：售后查 sop，query 由主题+正文拼成，top_k 取常量
     assert retriever.calls == [("sop", "测试邮件\n请帮我取消订单 ORD-123", DRAFT_RETRIEVAL_TOP_K)]
     # 知识摘录段进入 prompt，标注 document_id / 文档标题 / 距离
@@ -793,7 +836,18 @@ async def test_draft_node_distance_over_threshold_skips_llm() -> None:
         kb_type=KB_TYPE_SOP,
     )
 
-    assert result == {"draft_skipped_reason": "no_relevant_knowledge"}
+    assert result == {
+        "draft_skipped_reason": "no_relevant_knowledge",
+        "retrieval_query": "测试邮件\n请帮我取消订单 ORD-123",
+        "retrieved_chunks": [
+            {
+                "document_id": 11,
+                "title": "售后政策手册",
+                "distance": round(DRAFT_MAX_COSINE_DISTANCE + 0.1, 4),
+                "content": "不太相关的内容",
+            }
+        ],
+    }
     assert model.calls == []
 
 
@@ -810,7 +864,11 @@ async def test_draft_node_empty_retrieval_skips_llm() -> None:
         kb_type=KB_TYPE_SOP,
     )
 
-    assert result == {"draft_skipped_reason": "no_relevant_knowledge"}
+    assert result == {
+        "draft_skipped_reason": "no_relevant_knowledge",
+        "retrieval_query": "测试邮件\n请帮我取消订单 ORD-123",
+        "retrieved_chunks": [],
+    }
     assert model.calls == []
     assert len(retriever.calls) == 1
 
@@ -830,7 +888,11 @@ async def test_draft_node_retrieval_failure_degrades() -> None:
             kb_type=KB_TYPE_SOP,
         )
 
-    assert result == {"draft_skipped_reason": "retrieval_failed"}
+    assert result == {
+        "draft_skipped_reason": "retrieval_failed",
+        "retrieval_query": "测试邮件\n请帮我取消订单 ORD-123",
+        "retrieved_chunks": [],
+    }
     assert model.calls == []
     warn = next(e for e in cap if e["event"] == "draft_retrieval_failed")
     assert warn["kb_type"] == "sop"
@@ -838,7 +900,7 @@ async def test_draft_node_retrieval_failure_degrades() -> None:
 
 
 async def test_draft_node_generation_failure_degrades() -> None:
-    """LLM 起草失败 → 降级为 generation_failed，异常不外抛。"""
+    """LLM 起草失败 → 降级为 generation_failed，异常不外抛；检索证据保留。"""
     retriever = FakeRetriever(chunks=[_hit(11, 0.2, "退货政策内容")])
     model = FakeChatModel(error=RuntimeError("llm timeout"))
 
@@ -851,11 +913,17 @@ async def test_draft_node_generation_failure_degrades() -> None:
         kb_type=KB_TYPE_SOP,
     )
 
-    assert result == {"draft_skipped_reason": "generation_failed"}
+    assert result == {
+        "draft_skipped_reason": "generation_failed",
+        "retrieval_query": "测试邮件\n请帮我取消订单 ORD-123",
+        "retrieved_chunks": [
+            {"document_id": 11, "title": "售后政策手册", "distance": 0.2, "content": "退货政策内容"}
+        ],
+    }
 
 
 async def test_draft_node_none_output_degrades() -> None:
-    """LLM 返回 None → 降级为 generation_failed。"""
+    """LLM 返回 None → 降级为 generation_failed；检索证据保留。"""
     retriever = FakeRetriever(chunks=[_hit(11, 0.2, "退货政策内容")])
     model = FakeChatModel(output=None)
 
@@ -868,7 +936,13 @@ async def test_draft_node_none_output_degrades() -> None:
         kb_type=KB_TYPE_SOP,
     )
 
-    assert result == {"draft_skipped_reason": "generation_failed"}
+    assert result == {
+        "draft_skipped_reason": "generation_failed",
+        "retrieval_query": "测试邮件\n请帮我取消订单 ORD-123",
+        "retrieved_chunks": [
+            {"document_id": 11, "title": "售后政策手册", "distance": 0.2, "content": "退货政策内容"}
+        ],
+    }
 
 
 async def test_draft_node_intent_category_mismatch_skips_retrieval() -> None:
@@ -906,6 +980,26 @@ async def test_draft_node_empty_query_skips_retrieval() -> None:
 
     assert result == {"draft_skipped_reason": "empty_query"}
     assert retriever.calls == []
+
+
+async def test_draft_node_retrieval_evidence_truncates_content() -> None:
+    """retrieved_chunks 的 content 截断到 DRAFT_CHUNK_SNIPPET_CHARS，state 不搬运全文。"""
+    long_content = "退" * (DRAFT_CHUNK_SNIPPET_CHARS + 100)
+    retriever = FakeRetriever(chunks=[_hit(11, 0.2, long_content)])
+    model = FakeChatModel(output=_draft_output())
+
+    result = await _draft_node(
+        _base_state(primary_intent=INTENT_REFUND_REQUEST),
+        chat_model=model,
+        retriever=retriever,
+        category=DRAFT_CATEGORY_AFTER_SALE,
+        system_prompt=DRAFT_AFTERSALE_SYSTEM_PROMPT,
+        kb_type=KB_TYPE_SOP,
+    )
+
+    assert len(result["retrieved_chunks"][0]["content"]) == DRAFT_CHUNK_SNIPPET_CHARS
+    # 落库依据 draft_sources 的 snippet 仍是 200 字截断
+    assert result["draft_sources"][0]["snippet"] == "退" * 200
 
 
 # ---------------------------------------------------------------------------

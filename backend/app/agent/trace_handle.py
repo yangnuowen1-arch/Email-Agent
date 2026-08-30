@@ -2,7 +2,9 @@
 
 ``GraphTraceHandler`` 挂在 ``ainvoke`` 的 ``config={"callbacks": [...]}`` 上，
 把链路事件（节点 / LLM 的开始、耗时、token usage、错误）以 structlog 日志
-实时输出，同时收集在内部供 ``dump()`` 事后取用（测试 / 程序化分析）：
+实时输出，同时收集在内部供 ``dump()`` 事后取用（测试 / 程序化分析）、
+供 ``usage_summary()`` 聚合本次运行的 token 消耗（analyze / 翻译 / 草稿
+全部 LLM 调用求和）：
 
     handler = GraphTraceHandler()
     result = await graph.ainvoke(initial_state, config={"callbacks": [handler]})
@@ -162,3 +164,20 @@ class GraphTraceHandler(BaseCallbackHandler):
     def dump(self) -> list[dict[str, Any]]:
         """返回本次运行收集的全部事件（按发生顺序）。"""
         return list(self._events)
+
+    def usage_summary(self) -> dict[str, int] | None:
+        """聚合本次运行的 LLM token 消耗；无 LLM 调用（含全失败）返回 None。
+
+        一次 ainvoke 的 callbacks 覆盖图内全部 LLM 调用（analyze / 翻译 / 草稿），
+        汇总即单封邮件的总消耗；单条 usage 来自 ``on_llm_end`` 的 usage_metadata，
+        失败调用（llm_error）无 usage 不计入。
+        """
+        totals = {"llm_calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        for event in self._events:
+            if event["type"] != "llm_end":
+                continue
+            usage = event.get("usage") or {}
+            totals["llm_calls"] += 1
+            for key in ("input_tokens", "output_tokens", "total_tokens"):
+                totals[key] += int(usage.get(key) or 0)
+        return totals if totals["llm_calls"] else None
