@@ -35,6 +35,10 @@ class AppConfig:
     sync_timeout_seconds: int = 60
     # 日志级别，控制 JSON 结构化日志的输出粒度
     log_level: str = "INFO"
+    # Gemini Developer API 的密钥；未配置时仍可运行纯 IMAP 同步。
+    gemini_api_key: str | None = None
+    # 使用 Gemini 的裸模型 ID，不包含 "models/" 前缀。
+    gemini_model: str = "gemini-2.5-flash"
 
     def __post_init__(self) -> None:
         """初始化后校验：确保所有配置项都在合法范围内。"""
@@ -62,6 +66,8 @@ class AppConfig:
         if self.sync_timeout_seconds < 1:
             msg = f"SYNC_TIMEOUT_SECONDS must be >=1, got {self.sync_timeout_seconds!r}"
             raise ValueError(msg)
+        if not isinstance(self.gemini_model, str) or not self.gemini_model.strip():
+            raise ValueError("GEMINI_MODEL must not be empty")
 
     @classmethod
     def from_env(cls) -> AppConfig:
@@ -87,6 +93,11 @@ class AppConfig:
 
         # 日志级别统一转大写，空值回退到 INFO，避免大小写敏感导致配置不生效
         log_level = (os.getenv("LOG_LEVEL", "INFO") or "INFO").strip().upper() or "INFO"
+        gemini_api_key = (os.getenv("GEMINI_API_KEY") or "").strip() or None
+        gemini_model = (
+            (os.getenv("GEMINI_MODEL", "gemini-2.5-flash") or "gemini-2.5-flash").strip()
+            or "gemini-2.5-flash"
+        )
 
         return cls(
             database_url=database_url,
@@ -95,4 +106,6 @@ class AppConfig:
             sync_max_workers=sync_max_workers,
             sync_timeout_seconds=sync_timeout_seconds,
             log_level=log_level,
+            gemini_api_key=gemini_api_key,
+            gemini_model=gemini_model,
         )

@@ -12,6 +12,7 @@ from .client import (
     ToolCall,
 )
 from .errors import LLMGatewayError, NonRetryableLLMError, TransientLLMError
+from .gemini import GeminiLLMGateway
 from .mail_workflow import (
     GatewayMailAnalyzer,
     GatewayReplyDraftGenerator,
@@ -22,6 +23,7 @@ __all__ = [
     "EchoLLMClient",
     "GatewayMailAnalyzer",
     "GatewayReplyDraftGenerator",
+    "GeminiLLMGateway",
     "InvalidMailWorkflowModelOutputError",
     "LLMClient",
     "LLMGateway",

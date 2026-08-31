@@ -6,7 +6,7 @@
 email_accounts → IMAP → 解析邮件 → emails → 更新 last_sync_uid
 ```
 
-代码还提供可由 API/worker 注入 `LLMGateway` 后使用的邮件分析、版本化回复草稿和人工审批服务；它们没有 CLI 命令，也不会自动调用 SMTP。当前未绑定任何真实模型 provider，架构边界与分阶段计划见 [docs/architecture.md](docs/architecture.md)。
+代码还提供可由 API/worker 注入 `LLMGateway` 后使用的邮件分析、版本化回复草稿和人工审批服务；它们没有 CLI 命令，也不会自动调用 SMTP。项目现提供 Gemini Developer API adapter，但 CLI 不会自动调用它；架构边界与分阶段计划见 [docs/architecture.md](docs/architecture.md)。
 
 ## 环境要求
 
@@ -54,6 +54,32 @@ SYNC_MAX_WORKERS=5
 SYNC_TIMEOUT_SECONDS=60
 LOG_LEVEL=INFO
 ```
+
+### 3.1 配置 Gemini（可选）
+
+本项目支持 **Gemini Developer API / Google AI Studio** 的 API Key，不是 Vertex AI 的服务账号认证。先在 Google 的控制台撤销任何已暴露的旧 Key，再生成一把新的、受限的 Key；只把新 Key 放在本机 `.env`：
+
+```dotenv
+GEMINI_API_KEY=your_new_gemini_api_key
+GEMINI_MODEL=gemini-2.5-flash
+```
+
+不要把 Key 写进源码、测试、日志或 Git 提交。常见 Google AI Studio Key 通常以 `AIza` 开头；若你拿到的是其他平台的代理 Key，请先确认它的 API 地址和协议，不能直接当作原生 Gemini Key 使用。
+
+在未来的 API/worker 中，显式构造并注入 gateway 即可；`ingest` 命令不会因此调用模型：
+
+```python
+from app.agent import EmailAgent
+from app.core.container import build_container
+from app.core.settings import AppConfig
+from app.tools import build_default_tool_registry
+
+container = build_container(AppConfig.from_env())
+gateway = container.build_gemini_gateway()
+agent = EmailAgent(gateway, build_default_tool_registry(container.mail_query))
+```
+
+Gemini adapter 支持普通文本和受控的只读工具调用；模型返回的工具调用仍会经过本项目的参数验证与账号授权，不能获得 SMTP 发送权限。
 
 ### 4. 添加测试邮箱
 

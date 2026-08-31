@@ -81,6 +81,13 @@ the next model turn without allowing the model to choose its own account scope.
 provider.  It records requests and returns a configured sequence of model
 responses, so tool loops are tested without network access or model cost.
 
+`GeminiLLMGateway` is the production adapter for the Gemini Developer API. It
+maps this replayable transcript to Gemini content, function calls, and grouped
+function responses; it keeps the API key in configuration only and maps only
+network/limit/5xx failures to retryable gateway errors. The IMAP CLI does not
+construct this adapter: an authenticated API or worker must explicitly inject
+it, so synchronizing mail cannot unintentionally send content to a model.
+
 The default tool set is built in `app.tools.registry`, not in the composition
 root.  A future authenticated Agent/API request supplies the container's
 already-wired services to that factory, so new default tools have one

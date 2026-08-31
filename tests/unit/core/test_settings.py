@@ -7,6 +7,8 @@ from app.core.settings import AppConfig
 def _isolate_local_dotenv(monkeypatch):
     """单元测试只验证显式设置的环境变量，不读取开发者本地配置。"""
     monkeypatch.setattr("app.core.settings.load_dotenv", lambda override=False: None)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
 
 
 def test_from_env_success_with_minimal_vars(monkeypatch):
@@ -23,6 +25,8 @@ def test_from_env_success_with_minimal_vars(monkeypatch):
     assert cfg.sync_max_workers == 5
     assert cfg.sync_timeout_seconds == 60
     assert cfg.log_level == "INFO"
+    assert cfg.gemini_api_key is None
+    assert cfg.gemini_model == "gemini-2.5-flash"
 
 
 def test_from_env_missing_database_url_raises_clear_error(monkeypatch):
@@ -65,6 +69,17 @@ def test_from_env_custom_values_parsed(monkeypatch):
     assert cfg.sync_max_workers == 8
     assert cfg.sync_timeout_seconds == 120
     assert cfg.log_level == "DEBUG"
+
+
+def test_from_env_reads_optional_gemini_settings(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-pro")
+
+    cfg = AppConfig.from_env()
+
+    assert cfg.gemini_api_key == "test-gemini-key"
+    assert cfg.gemini_model == "gemini-2.5-pro"
 
 
 def test_from_env_zero_workers_raises(monkeypatch):

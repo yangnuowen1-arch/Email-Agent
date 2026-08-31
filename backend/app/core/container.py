@@ -12,7 +12,7 @@ from app.db.email_query_store import SqlAlchemyMailQueryStore
 from app.db.email_sync_store import SqlAlchemyEmailSyncStore
 from app.db.engine import Database, build_database
 from app.db.mail_workflow_store import SqlAlchemyMailWorkflowStore
-from app.llm import GatewayMailAnalyzer, GatewayReplyDraftGenerator, LLMGateway
+from app.llm import GeminiLLMGateway, GatewayMailAnalyzer, GatewayReplyDraftGenerator, LLMGateway
 from app.observability import configure_logging
 from app.ports import (
     EmailSyncStore,
@@ -61,6 +61,20 @@ class Container:
     mail_query: MailQueryService
     mail_analysis_store: MailAnalysisStore
     reply_draft_store: ReplyDraftStore
+
+    def build_gemini_gateway(self) -> GeminiLLMGateway:
+        """Create the configured Gemini gateway for an API or worker request.
+
+        The IMAP-only CLI deliberately never calls this method, so adding a key
+        cannot cause email ingestion to send mail content to a model by itself.
+        """
+
+        if self.config.gemini_api_key is None:
+            raise ValueError("GEMINI_API_KEY is required to use the Gemini gateway")
+        return GeminiLLMGateway(
+            api_key=self.config.gemini_api_key,
+            model=self.config.gemini_model,
+        )
 
     def build_mail_workflow(self, gateway: LLMGateway) -> MailWorkflowServices:
         """Create analysis/draft use cases without granting SMTP capability.
