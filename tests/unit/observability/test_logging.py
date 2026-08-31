@@ -1,5 +1,6 @@
 import json
 import logging
+import sys
 
 import pytest
 
@@ -46,6 +47,7 @@ def test_configure_logging_outputs_valid_json():
     configure_logging("INFO")
 
     handler = _configured_handler()
+    assert handler.stream is sys.stderr
     record = _make_record("test.json", logging.INFO, "hello world")
     formatted = handler.format(record)
     parsed = json.loads(formatted)
@@ -54,6 +56,18 @@ def test_configure_logging_outputs_valid_json():
     assert parsed["level"] == "info"
     assert parsed["logger"] == "test.json"
     assert "timestamp" in parsed
+
+
+def test_configured_structlog_event_is_rendered_once(capsys):
+    import structlog
+
+    configure_logging("INFO")
+    structlog.get_logger("test.bound").info("workflow_started", email_id=42)
+
+    parsed = json.loads(capsys.readouterr().err)
+    assert parsed["event"] == "workflow_started"
+    assert parsed["email_id"] == 42
+    assert parsed["logger"] == "test.bound"
 
 
 def test_configure_logging_formats_positional_args():

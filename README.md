@@ -6,7 +6,7 @@
 email_accounts → IMAP → 解析邮件 → emails → 更新 last_sync_uid
 ```
 
-代码还提供可由 API/worker 注入 `LLMGateway` 后使用的邮件分析、版本化回复草稿和人工审批服务；它们没有 CLI 命令，也不会自动调用 SMTP。项目现提供 Gemini Developer API adapter，但 CLI 不会自动调用它；架构边界与分阶段计划见 [docs/architecture.md](docs/architecture.md)。
+代码还提供邮件分析、版本化回复草稿和人工审批服务。`workflow` 子命令可用受控的本机 profile 跑通人工验收；它不是多人生产认证，也不会自动调用 SMTP。项目现提供 Gemini Developer API adapter；架构边界与分阶段计划见 [docs/architecture.md](docs/architecture.md)。
 
 ## 环境要求
 
@@ -61,10 +61,11 @@ LOG_LEVEL=INFO
 
 ```dotenv
 GEMINI_API_KEY=your_new_gemini_api_key
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-3.6-flash
+GEMINI_TIMEOUT_SECONDS=30
 ```
 
-不要把 Key 写进源码、测试、日志或 Git 提交。常见 Google AI Studio Key 通常以 `AIza` 开头；若你拿到的是其他平台的代理 Key，请先确认它的 API 地址和协议，不能直接当作原生 Gemini Key 使用。
+`GEMINI_TIMEOUT_SECONDS` 控制单次模型请求的最长等待时间，默认 `30` 秒，可填写正小数（例如 `12.5`）。不要把 Key 写进源码、测试、日志或 Git 提交。常见 Google AI Studio Key 通常以 `AIza` 开头；若你拿到的是其他平台的代理 Key，请先确认它的 API 地址和协议，不能直接当作原生 Gemini Key 使用。
 
 在未来的 API/worker 中，显式构造并注入 gateway 即可；`ingest` 命令不会因此调用模型：
 
@@ -80,6 +81,18 @@ agent = EmailAgent(gateway, build_default_tool_registry(container.mail_query))
 ```
 
 Gemini adapter 支持普通文本和受控的只读工具调用；模型返回的工具调用仍会经过本项目的参数验证与账号授权，不能获得 SMTP 发送权限。
+
+### 3.2 配置本机 workflow CLI profile（可选）
+
+这组 profile **只用于本机验收**，不是生产环境的登录或权限系统。它的作用是让 CLI 从 `.env` 的受控配置中得到操作者、角色和允许访问的邮箱账号；命令行不会接受 `actor_id` 或账号范围参数。
+
+将下面一行写入 `.env`，并把账号 ID 改成测试邮箱在 `email_accounts.id` 中的真实值：
+
+```dotenv
+WORKFLOW_CLI_PROFILES_JSON='{"author":{"actor_id":"local-author","roles":["author"],"allowed_account_ids":[1]},"reviewer":{"actor_id":"local-reviewer","roles":["reviewer"],"allowed_account_ids":[1]}}'
+```
+
+`author` 可以分析、创建草稿和提交审核；`reviewer` 可以查看和批准草稿。请将它们配置为不同的 `actor_id`，以便本机验收清晰地保留作者与审核人的审计记录。
 
 ### 4. 添加测试邮箱
 
@@ -123,6 +136,38 @@ ORDER BY id;
 
 `email-agent` 是命令名；`app` 是 Python 模块名。它们都通过 `ingest` 子命令执行同步；
 裸执行 `python -m app` 或 `email-agent` 只显示帮助，不会访问邮箱或数据库。
+
+### 本机 workflow CLI 验收
+
+先完成一次 `ingest`，再从 `emails` 表找到目标邮件的 `id`。假设它是 `42`，按以下顺序运行：
+
+```bash
+uv run email-agent workflow analyze --profile author --email-id 42
+# 输出 JSON；记下 analysis_id
+
+uv run email-agent workflow create-draft \
+  --profile author \
+  --email-id 42 \
+  --analysis-id <analysis_id>
+# 输出 JSON；记下 draft_id，初始 version 为 1、status 为 draft
+
+uv run email-agent workflow submit \
+  --profile author \
+  --draft-id <draft_id> \
+  --expected-version 1
+# 输出 version 2、status pending_review
+
+uv run email-agent workflow show --profile reviewer --draft-id <draft_id>
+
+uv run email-agent workflow approve \
+  --profile reviewer \
+  --draft-id <draft_id> \
+  --expected-version 2 \
+  --comment "内容已核对"
+# 输出 version 3、status approved
+```
+
+每条 workflow 命令都会在标准输出写一行 JSON；运行日志在标准错误输出，便于脚本解析结果。只有 `analyze` 和 `create-draft` 会调用模型；`show`、`submit`、`approve` 只读写数据库。批准只写入版本与审计记录，**不会发送邮件**。这套 profile 不强制“作者与审核人必须不同”，因此仅用于本机验收；正式环境需要由认证与审批策略强制职责分离。常见验收负例：作者执行 `approve` 应失败；传旧的 `--expected-version` 应失败；无权访问的账号资源应只显示“不可用”，不会泄露归属。
 
 ### 参数说明
 

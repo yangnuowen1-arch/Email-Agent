@@ -12,7 +12,7 @@ from app.db.email_query_store import SqlAlchemyMailQueryStore
 from app.db.email_sync_store import SqlAlchemyEmailSyncStore
 from app.db.engine import Database, build_database
 from app.db.mail_workflow_store import SqlAlchemyMailWorkflowStore
-from app.llm import GeminiLLMGateway, GatewayMailAnalyzer, GatewayReplyDraftGenerator, LLMGateway
+from app.llm import GatewayMailAnalyzer, GatewayReplyDraftGenerator, GeminiLLMGateway, LLMGateway
 from app.observability import configure_logging
 from app.ports import (
     EmailSyncStore,
@@ -74,6 +74,7 @@ class Container:
         return GeminiLLMGateway(
             api_key=self.config.gemini_api_key,
             model=self.config.gemini_model,
+            timeout_seconds=self.config.gemini_timeout_seconds,
         )
 
     def build_mail_workflow(self, gateway: LLMGateway) -> MailWorkflowServices:

@@ -53,7 +53,7 @@ def _tool() -> ToolDefinition:
 def _gateway(transport: FakeGeminiTransport) -> GeminiLLMGateway:
     return GeminiLLMGateway(
         api_key="test-gemini-key",
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         transport=transport,
     )
 
@@ -96,7 +96,7 @@ async def test_gemini_gateway_maps_system_tools_and_function_calls() -> None:
         tool_calls=[ToolCall(id="call_1", name="search_mail", arguments={"query": "invoice"})],
     )
     url, headers, payload, timeout_seconds = transport.calls[0]
-    assert url.endswith("/models/gemini-2.5-flash:generateContent")
+    assert url.endswith("/models/gemini-3.6-flash:generateContent")
     assert headers["x-goog-api-key"] == "test-gemini-key"
     assert timeout_seconds == 30.0
     assert payload == {
@@ -232,7 +232,7 @@ async def test_gemini_gateway_rejects_malformed_provider_response() -> None:
 async def test_gemini_gateway_includes_a_redacted_provider_error_summary() -> None:
     provider_error = {
         "error": {
-            "message": "models/gemini-2.5-flash is unavailable; key=AQ.secret-value",
+            "message": "models/gemini-3.6-flash is unavailable; key=AQ.secret-value",
         }
     }
     transport = FakeGeminiTransport(
@@ -251,7 +251,7 @@ async def test_gemini_gateway_includes_a_redacted_provider_error_summary() -> No
         )
 
     message = str(exc_info.value)
-    assert "models/gemini-2.5-flash is unavailable" in message
+    assert "models/gemini-3.6-flash is unavailable" in message
     assert "AQ.secret-value" not in message
     assert "[redacted]" in message
 

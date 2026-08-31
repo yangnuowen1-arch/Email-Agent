@@ -4,6 +4,7 @@ import asyncio
 
 import typer
 
+from app.cli.workflow import workflow_app
 from app.core.container import Container, build_container
 from app.core.settings import AppConfig
 from app.schemas import SyncRequest
@@ -12,6 +13,7 @@ app = typer.Typer(
     help="email-agent-cli",
     invoke_without_command=True,
 )
+app.add_typer(workflow_app, name="workflow")
 
 
 @app.callback()
@@ -40,6 +42,7 @@ def cli(ctx: typer.Context) -> None:
         db_pool_max=config.db_pool_max_size,
     )
     ctx.obj = container
+    ctx.call_on_close(lambda: _close_container(container))
 
 
 @app.command()
@@ -66,38 +69,40 @@ async def _run(container: Container, *, full: bool, limit: int | None) -> None:
     log = container.logger
     log.info("ingest_started", full=full, limit=limit)
 
-    try:
-        report = await container.mail_sync.ingest(SyncRequest(full=full, limit=limit))
+    report = await container.mail_sync.ingest(SyncRequest(full=full, limit=limit))
 
-        log.info(
-            "ingest_finished",
-            full=full,
-            limit=limit,
-            inserted=report.total_inserted,
-            skipped=report.total_skipped,
-            failed=report.total_failed,
-            duration_ms=report.duration_ms,
-        )
-        typer.echo(
-            f"inserted={report.total_inserted} skipped={report.total_skipped} "
-            f"failed={report.total_failed} duration_ms={report.duration_ms}"
-        )
-        for result in report.results:
-            if result.error:
-                log.error(
-                    "account_ingest_failed",
-                    account_id=result.account_id,
-                    account_name=result.name,
-                    error=result.error,
-                )
-                typer.echo(
-                    f"  account {result.account_id} ({result.name}) ERROR: {result.error}",
-                    err=True,
-                )
-    finally:
-        # 无论同步是否在进程级失败，都要释放数据库连接池。
-        await container.close_all()
-        log.info("container_closed")
+    log.info(
+        "ingest_finished",
+        full=full,
+        limit=limit,
+        inserted=report.total_inserted,
+        skipped=report.total_skipped,
+        failed=report.total_failed,
+        duration_ms=report.duration_ms,
+    )
+    typer.echo(
+        f"inserted={report.total_inserted} skipped={report.total_skipped} "
+        f"failed={report.total_failed} duration_ms={report.duration_ms}"
+    )
+    for result in report.results:
+        if result.error:
+            log.error(
+                "account_ingest_failed",
+                account_id=result.account_id,
+                account_name=result.name,
+                error=result.error,
+            )
+            typer.echo(
+                f"  account {result.account_id} ({result.name}) ERROR: {result.error}",
+                err=True,
+            )
+
+
+def _close_container(container: Container) -> None:
+    """Release process resources for commands, help, and parse failures alike."""
+
+    asyncio.run(container.close_all())
+    container.logger.info("container_closed")
 
 
 def main() -> None:

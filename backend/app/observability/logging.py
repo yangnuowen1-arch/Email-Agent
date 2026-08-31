@@ -44,7 +44,10 @@ def configure_logging(log_level: str = "INFO") -> None:
         processors=[
             structlog.stdlib.filter_by_level,
             *shared,
-            structlog.processors.JSONRenderer(),
+            # The handler below owns the final JSON rendering.  Passing the
+            # event dictionary through prevents structlog events from being
+            # rendered once and then embedded as a JSON string a second time.
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
         context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),
@@ -55,7 +58,9 @@ def configure_logging(log_level: str = "INFO") -> None:
     root = logging.getLogger()
     root.setLevel(log_level)
 
-    handler = logging.StreamHandler(sys.stdout)
+    # Keep machine-readable command results on stdout.  Operational logs belong
+    # on stderr so callers can safely capture a CLI result as JSON.
+    handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             processor=structlog.processors.JSONRenderer(),

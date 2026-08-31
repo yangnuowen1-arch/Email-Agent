@@ -18,7 +18,7 @@ GeminiTransport = Callable[
     Awaitable[dict[str, Any]],
 ]
 
-_DEFAULT_MODEL = "gemini-2.5-flash"
+_DEFAULT_MODEL = "gemini-3.6-flash"
 _API_URL_PREFIX = "https://generativelanguage.googleapis.com/v1beta/models/"
 _MAX_PROVIDER_ERROR_MESSAGE_CHARS = 500
 _API_KEY_PATTERN = re.compile(r"\b(?:AIza[A-Za-z0-9_-]+|AQ\.[A-Za-z0-9_-]+)\b")
@@ -303,7 +303,11 @@ def _required_content(message: LLMMessage) -> str:
 
 def _is_model_name(value: str) -> bool:
     candidate = value.strip()
-    return bool(candidate) and len(candidate) <= 128 and all(
-        (character.isascii() and character.isalnum()) or character in {".", "_", "-"}
-        for character in candidate
+    return (
+        bool(candidate)
+        and len(candidate) <= 128
+        and all(
+            (character.isascii() and character.isalnum()) or character in {".", "_", "-"}
+            for character in candidate
+        )
     )

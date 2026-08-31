@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
+from math import isfinite
 
 from dotenv import load_dotenv
+
+from app.core.workflow_profiles import (
+    WorkflowPrincipal,
+    parse_workflow_cli_profiles,
+    resolve_workflow_cli_profile,
+)
 
 
 def _parse_int(name: str, raw: str | None, default: int) -> int:
@@ -18,6 +26,22 @@ def _parse_int(name: str, raw: str | None, default: int) -> int:
         # 转换失败时抛出带变量名的错误，方便用户定位是哪个环境变量写错了
         msg = f"{name} must be int, got {raw!r}"
         raise ValueError(msg) from exc
+
+
+def _parse_positive_float(name: str, raw: str | None, default: float) -> float:
+    """Parse an optional positive, finite timeout value from the environment."""
+
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        msg = f"{name} must be a positive finite number, got {raw!r}"
+        raise ValueError(msg) from exc
+    if not isfinite(value) or value <= 0:
+        msg = f"{name} must be a positive finite number, got {raw!r}"
+        raise ValueError(msg)
+    return value
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -38,7 +62,11 @@ class AppConfig:
     # Gemini Developer API 的密钥；未配置时仍可运行纯 IMAP 同步。
     gemini_api_key: str | None = None
     # 使用 Gemini 的裸模型 ID，不包含 "models/" 前缀。
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.6-flash"
+    # Gemini 单次 HTTP 调用超时时间（秒），支持小数。
+    gemini_timeout_seconds: float = 30.0
+    # 仅供本机 CLI 冒烟测试使用的可信 profile，不是生产认证机制。
+    workflow_cli_profiles_json: str | None = None
 
     def __post_init__(self) -> None:
         """初始化后校验：确保所有配置项都在合法范围内。"""
@@ -68,6 +96,32 @@ class AppConfig:
             raise ValueError(msg)
         if not isinstance(self.gemini_model, str) or not self.gemini_model.strip():
             raise ValueError("GEMINI_MODEL must not be empty")
+        if (
+            isinstance(self.gemini_timeout_seconds, bool)
+            or not isinstance(self.gemini_timeout_seconds, (int, float))
+            or not isfinite(self.gemini_timeout_seconds)
+            or self.gemini_timeout_seconds <= 0
+        ):
+            msg = (
+                "GEMINI_TIMEOUT_SECONDS must be a positive finite number, "
+                f"got {self.gemini_timeout_seconds!r}"
+            )
+            raise ValueError(msg)
+
+        if self.workflow_cli_profiles_json is not None and not isinstance(
+            self.workflow_cli_profiles_json, str
+        ):
+            raise ValueError("workflow_cli_profiles_json must be a string or None")
+
+    @property
+    def workflow_cli_profiles(self) -> Mapping[str, WorkflowPrincipal]:
+        """Parse local profiles only when a workflow command actually needs them."""
+
+        return parse_workflow_cli_profiles(self.workflow_cli_profiles_json)
+
+    def resolve_workflow_cli_profile(self, profile_name: str) -> WorkflowPrincipal:
+        """Return a trusted local CLI principal selected by its configured name."""
+        return resolve_workflow_cli_profile(self.workflow_cli_profiles, profile_name)
 
     @classmethod
     def from_env(cls) -> AppConfig:
@@ -95,9 +149,12 @@ class AppConfig:
         log_level = (os.getenv("LOG_LEVEL", "INFO") or "INFO").strip().upper() or "INFO"
         gemini_api_key = (os.getenv("GEMINI_API_KEY") or "").strip() or None
         gemini_model = (
-            (os.getenv("GEMINI_MODEL", "gemini-2.5-flash") or "gemini-2.5-flash").strip()
-            or "gemini-2.5-flash"
+            os.getenv("GEMINI_MODEL", "gemini-3.6-flash") or "gemini-3.6-flash"
+        ).strip() or "gemini-3.6-flash"
+        gemini_timeout_seconds = _parse_positive_float(
+            "GEMINI_TIMEOUT_SECONDS", os.getenv("GEMINI_TIMEOUT_SECONDS"), 30.0
         )
+        workflow_cli_profiles_json = os.getenv("WORKFLOW_CLI_PROFILES_JSON")
 
         return cls(
             database_url=database_url,
@@ -108,4 +165,6 @@ class AppConfig:
             log_level=log_level,
             gemini_api_key=gemini_api_key,
             gemini_model=gemini_model,
+            gemini_timeout_seconds=gemini_timeout_seconds,
+            workflow_cli_profiles_json=workflow_cli_profiles_json,
         )

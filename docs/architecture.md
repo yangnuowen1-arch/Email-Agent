@@ -8,12 +8,13 @@ Email-Agent is being evolved into a human-supervised enterprise-mail assistant:
 2. classify mail, extract information, and prepare reply drafts through an LLM;
 3. require a human approval before any outbound action is sent through SMTP.
 
-The current runnable entry point covers only the first capability: **inbound
-mail sync and archival**.  The codebase may add read-only tool and LLM-gateway
-contracts ahead of a user-facing agent entry point, but those contracts do not
-enable automatic mail analysis, approval, or SMTP delivery.  Those capabilities
-have different side-effect and audit requirements and will be added as separate
-use cases.
+The runnable entry point covers inbound mail sync and a deliberately local
+workflow CLI for manually exercising analysis, draft creation, and human
+approval.  The CLI resolves a named profile to a server-configured actor, role,
+and mailbox scope; it is an acceptance-test boundary, not a multi-user
+authentication system.  It does not automatically analyze new mail, schedule
+work, or deliver mail through SMTP.  Those capabilities have different
+side-effect and audit requirements and will be added as separate use cases.
 
 ## Dependency direction
 
@@ -169,7 +170,9 @@ This trades an inexpensive duplicate read for avoiding permanent mail loss.
 ## Analysis, reply draft, and human review
 
 The workflow below is implemented as application services and remains separate
-from syncing:
+from syncing.  A local CLI may invoke each step explicitly after resolving a
+trusted local profile; a future API must derive the same authority from real
+authentication rather than trusting request fields:
 
 ```text
 stored mail --> analysis service --> reply-draft service --> pending approval
