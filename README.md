@@ -1,12 +1,12 @@
 # Email-Agent
 
-当前可运行能力是：从 PostgreSQL 读取邮箱账号配置，通过 IMAP 增量拉取邮件，解析后写回 PostgreSQL。
+当前可运行命令是：从 PostgreSQL 读取邮箱账号配置，通过 IMAP 增量拉取邮件，解析后写回 PostgreSQL。
 
 ```
 email_accounts → IMAP → 解析邮件 → emails → 更新 last_sync_uid
 ```
 
-产品目标还包括 LLM 邮件理解、回复草稿和人工审批后的 SMTP 外发；这些能力尚未接入当前运行入口。架构边界与分阶段计划见 [docs/architecture.md](docs/architecture.md)。
+代码还提供可由 API/worker 注入 `LLMGateway` 后使用的邮件分析、版本化回复草稿和人工审批服务；它们没有 CLI 命令，也不会自动调用 SMTP。当前未绑定任何真实模型 provider，架构边界与分阶段计划见 [docs/architecture.md](docs/architecture.md)。
 
 ## 环境要求
 
@@ -37,6 +37,8 @@ uv sync --extra dev --reinstall-package email-agent
 
 - `email_accounts`：邮箱账号和同步断点
 - `emails`：已解析并入库的邮件
+- `email_analyses`：结构化邮件分析结果
+- `reply_draft_versions`、`reply_draft_transitions`：版本化草稿与人工审批审计记录
 
 ### 3. 配置环境变量
 

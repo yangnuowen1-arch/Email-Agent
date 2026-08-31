@@ -9,6 +9,9 @@ email_accounts (1) ──────< (N) emails
      │                        │
  账号配置(输入)            已拉取邮件(输出)
      └── last_sync_uid ──────┘  ← 断点续传的桥梁
+                                  │
+                                  ├────< email_analyses
+                                  └────< reply_draft_versions ────< reply_draft_transitions
 ```
 
 - 一条 `email_accounts` 记录对应一个真实邮箱，是程序的唯一输入源。
@@ -126,6 +129,84 @@ COMMENT ON COLUMN emails.updated_at IS '最后更新时间（UTC），随行更�
 
 写入方式：批量 `INSERT ... ON CONFLICT (account_id, uid) DO NOTHING`。
 
+### 2.3 email_analyses — 邮件分析结果
+
+```sql
+CREATE TABLE email_analyses (
+    analysis_id    TEXT PRIMARY KEY,
+    email_id       INT NOT NULL,
+    account_id     INT NOT NULL,
+    summary        TEXT NOT NULL,
+    intent         TEXT NOT NULL,
+    urgency        TEXT NOT NULL,
+    reply_required BOOL NOT NULL,
+    key_points     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    action_items   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    analyzed_at    TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX email_analyses_account_email_idx
+ON email_analyses (account_id, email_id);
+```
+
+- 一次分析是不可变记录；重新分析应创建新的 `analysis_id`，而不是覆盖旧结果。
+- `account_id` 与 `email_id` 是授权过滤的冗余投影，查询时必须同时使用账号范围过滤。
+- `key_points`、`action_items` 是受限长度的结构化文本数组，不能包含原始模型提示或工具调用数据。
+
+### 2.4 reply_draft_versions — 版本化回复草稿
+
+```sql
+CREATE TABLE reply_draft_versions (
+    draft_id       TEXT NOT NULL,
+    version        INT NOT NULL,
+    email_id       INT NOT NULL,
+    account_id     INT NOT NULL,
+    analysis_id    TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    recipients     JSONB NOT NULL,
+    subject        TEXT NOT NULL,
+    body_text      TEXT NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL,
+    updated_at     TIMESTAMPTZ NOT NULL,
+    created_by     TEXT NOT NULL,
+    updated_by     TEXT NOT NULL,
+    reviewed_by    TEXT,
+    reviewed_at    TIMESTAMPTZ,
+    review_comment TEXT,
+    PRIMARY KEY (draft_id, version)
+);
+
+CREATE INDEX reply_draft_versions_account_draft_idx
+ON reply_draft_versions (account_id, draft_id);
+CREATE INDEX reply_draft_versions_email_idx ON reply_draft_versions (email_id);
+```
+
+- `draft_id` 标识同一份草稿，`version` 单调递增；**禁止原地更新**已生成的内容。
+- 状态机为 `draft → pending_review → approved | rejected`；被拒绝后可生成新 `draft` 版本，已批准版本不可修改或撤销。
+- 本表只保存草稿和审核状态，**没有 SMTP 投递字段，也不代表邮件已经发送**。
+
+### 2.5 reply_draft_transitions — 草稿审批审计
+
+```sql
+CREATE TABLE reply_draft_transitions (
+    draft_id      TEXT NOT NULL,
+    to_version    INT NOT NULL,
+    from_version  INT,
+    from_status   TEXT,
+    to_status     TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    actor_id      TEXT NOT NULL,
+    occurred_at   TIMESTAMPTZ NOT NULL,
+    comment       TEXT,
+    PRIMARY KEY (draft_id, to_version)
+);
+
+CREATE INDEX reply_draft_transitions_draft_idx
+ON reply_draft_transitions (draft_id, to_version);
+```
+
+每写入一个草稿版本，必须在同一事务中写入一条对应 transition。这使得审批者、审核意见和被批准的精确版本可追溯。
+
 ## 3. 设计说明
 
 ### 为什么幂等键是 `(account_id, uid)` 而不是 message_id？
@@ -160,3 +241,7 @@ COMMENT ON COLUMN emails.updated_at IS '最后更新时间（UTC），随行更�
 `repository/` 改为基于 `Session` 的薄封装（同一账号的邮件入库与断点推进共享一个 Session，由一次 `commit()` 原子提交）。
 **本变更不修改任何表结构、约束或列定义**，原有 DDL（含 `(account_id, uid)` 唯一约束）保持不变，幂等写入改为 `pg_insert(...).on_conflict_do_nothing()`。
 驱动统一使用 psycopg v3（连接串 `postgresql+psycopg://`），不再兼容 psycopg2。
+
+### 2026-08-31 增加分析、回复草稿与人工审批工作流
+
+新增 `email_analyses`、`reply_draft_versions`、`reply_draft_transitions` 三张表；执行第 2.3–2.5 节的 `CREATE TABLE` 和 `CREATE INDEX` 语句完成迁移。分析记录与草稿版本均为追加式；每次草稿创建、修订、提交审核、批准、拒绝或撤回均在一个事务内写入新版本和审计 transition。`reply_draft_versions` 不包含投递状态或 SMTP 凭证，批准不会自动发信。

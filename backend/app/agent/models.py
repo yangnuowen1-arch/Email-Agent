@@ -18,6 +18,23 @@ class AgentTerminationReason(StrEnum):
     MAX_STEPS = "max_steps"
     MODEL_TIMEOUT = "model_timeout"
     TOOL_CALL_LIMIT = "tool_call_limit"
+    RETRY_EXHAUSTED = "retry_exhausted"
+    NON_RETRYABLE_ERROR = "non_retryable_error"
+
+
+class AgentNodeName(StrEnum):
+    """Graph node names exposed in safe execution telemetry."""
+
+    MODEL = "model"
+    TOOLS = "tools"
+
+
+class AgentNodeErrorKind(StrEnum):
+    """Stable, non-sensitive failure categories for graph-node telemetry."""
+
+    TIMEOUT = "timeout"
+    TRANSIENT = "transient"
+    NON_RETRYABLE = "non_retryable"
 
 
 class AgentRunRequest(BaseModel):
@@ -35,6 +52,18 @@ class AgentRunRequest(BaseModel):
     max_steps: int = Field(default=4, ge=1, le=20)
     max_tool_calls_per_turn: int = Field(default=8, ge=1, le=20)
     model_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    node_retry_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        description="Maximum attempts per transient graph-node failure, including the first.",
+    )
+    node_retry_initial_interval_seconds: float = Field(
+        default=0.1,
+        ge=0,
+        le=10,
+        description="Delay before the first graph-node retry; later delays use bounded backoff.",
+    )
     run_id: str = Field(default_factory=lambda: uuid4().hex, min_length=1, max_length=128)
 
     @field_validator("allowed_account_ids")
@@ -76,6 +105,31 @@ class AgentToolEvent(BaseModel):
         return self
 
 
+class AgentNodeEvent(BaseModel):
+    """Safe audit event emitted whenever a graph node attempt fails.
+
+    Raw provider exception text is deliberately omitted because it can contain
+    request metadata or credentials.  ``attempt`` is local to the current
+    node invocation, so a later successful model turn starts again at one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    node: AgentNodeName
+    attempt: int = Field(ge=1)
+    error_kind: AgentNodeErrorKind
+    retryable: bool
+    will_retry: bool
+
+    @model_validator(mode="after")
+    def _matches_retry_decision(self) -> AgentNodeEvent:
+        if self.will_retry and not self.retryable:
+            raise ValueError("only retryable node failures can be retried")
+        if self.error_kind is AgentNodeErrorKind.NON_RETRYABLE and self.retryable:
+            raise ValueError("non-retryable node failures cannot be retryable")
+        return self
+
+
 class AgentRunResult(BaseModel):
     """Safe result returned after the graph reaches a terminal state."""
 
@@ -86,3 +140,4 @@ class AgentRunResult(BaseModel):
     model_turns: int = Field(ge=0)
     termination_reason: AgentTerminationReason
     tool_events: tuple[AgentToolEvent, ...] = ()
+    node_events: tuple[AgentNodeEvent, ...] = ()

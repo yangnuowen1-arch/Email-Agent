@@ -83,9 +83,7 @@ async def test_scripted_gateway_returns_scripted_tool_call_and_records_request()
     gateway = ScriptedLLMGateway(
         [
             LLMResponse(
-                tool_calls=[
-                    ToolCall(id="call_1", name="search_mail", arguments={"query": "quote"})
-                ]
+                tool_calls=[ToolCall(id="call_1", name="search_mail", arguments={"query": "quote"})]
             )
         ]
     )

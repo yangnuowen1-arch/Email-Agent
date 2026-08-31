@@ -8,13 +8,21 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from app.agent import AgentRunRequest, AgentTerminationReason, EmailAgent
+from app.agent import (
+    AgentNodeErrorKind,
+    AgentNodeName,
+    AgentRunRequest,
+    AgentTerminationReason,
+    EmailAgent,
+)
 from app.llm import (
     LLMMessage,
     LLMMessageRole,
     LLMResponse,
+    NonRetryableLLMError,
     ScriptedLLMGateway,
     ToolCall,
+    TransientLLMError,
 )
 from app.schemas.tools import ToolDefinition, ToolInvocationResult
 from app.tools import ToolContext, ToolRegistry
@@ -53,6 +61,8 @@ def _request(
     max_steps: int = 4,
     max_tool_calls_per_turn: int = 8,
     model_timeout_seconds: float = 30.0,
+    node_retry_max_attempts: int = 3,
+    node_retry_initial_interval_seconds: float = 0.0,
 ) -> AgentRunRequest:
     return AgentRunRequest(
         run_id="run-test",
@@ -61,6 +71,8 @@ def _request(
         max_steps=max_steps,
         max_tool_calls_per_turn=max_tool_calls_per_turn,
         model_timeout_seconds=model_timeout_seconds,
+        node_retry_max_attempts=node_retry_max_attempts,
+        node_retry_initial_interval_seconds=node_retry_initial_interval_seconds,
     )
 
 
@@ -213,9 +225,161 @@ class SlowGateway:
 async def test_agent_returns_a_stable_terminal_state_when_the_model_times_out() -> None:
     agent = EmailAgent(SlowGateway(), ToolRegistry(()))
 
-    result = await agent.run(_request(model_timeout_seconds=0.001))
+    result = await agent.run(_request(model_timeout_seconds=0.001, node_retry_max_attempts=2))
 
     assert result.answer is None
     assert result.model_turns == 1
     assert result.termination_reason is AgentTerminationReason.MODEL_TIMEOUT
     assert result.tool_events == ()
+    assert [
+        (event.attempt, event.error_kind, event.will_retry) for event in result.node_events
+    ] == [
+        (1, AgentNodeErrorKind.TIMEOUT, True),
+        (2, AgentNodeErrorKind.TIMEOUT, False),
+    ]
+
+
+class TransientThenTextGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate(self, request) -> LLMResponse:
+        self.calls += 1
+        if self.calls == 1:
+            raise TransientLLMError("temporary provider outage")
+        return LLMResponse(text="Recovered response")
+
+
+async def test_agent_retries_a_typed_transient_model_failure_and_records_it() -> None:
+    gateway = TransientThenTextGateway()
+    agent = EmailAgent(gateway, ToolRegistry(()))
+
+    result = await agent.run(_request(node_retry_max_attempts=2))
+
+    assert gateway.calls == 2
+    assert result.answer == "Recovered response"
+    assert result.model_turns == 1
+    assert result.termination_reason is AgentTerminationReason.COMPLETED
+    assert result.node_events[0].node is AgentNodeName.MODEL
+    assert result.node_events[0].attempt == 1
+    assert result.node_events[0].error_kind is AgentNodeErrorKind.TRANSIENT
+    assert result.node_events[0].retryable is True
+    assert result.node_events[0].will_retry is True
+
+
+class AlwaysTransientGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate(self, request) -> LLMResponse:
+        self.calls += 1
+        raise TransientLLMError("temporary provider outage")
+
+
+async def test_agent_terminates_after_a_typed_transient_error_exhausts_retries() -> None:
+    gateway = AlwaysTransientGateway()
+    agent = EmailAgent(gateway, ToolRegistry(()))
+
+    result = await agent.run(_request(node_retry_max_attempts=2))
+
+    assert gateway.calls == 2
+    assert result.answer is None
+    assert result.model_turns == 1
+    assert result.termination_reason is AgentTerminationReason.RETRY_EXHAUSTED
+    assert [(event.attempt, event.will_retry) for event in result.node_events] == [
+        (1, True),
+        (2, False),
+    ]
+
+
+class NonRetryableGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate(self, request) -> LLMResponse:
+        self.calls += 1
+        raise NonRetryableLLMError("invalid credentials")
+
+
+class UnexpectedGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate(self, request) -> LLMResponse:
+        self.calls += 1
+        raise RuntimeError("unexpected provider bug")
+
+
+@pytest.mark.parametrize("gateway_type", [NonRetryableGateway, UnexpectedGateway])
+async def test_agent_does_not_retry_nonretryable_or_unclassified_model_errors(
+    gateway_type,
+) -> None:
+    gateway = gateway_type()
+    agent = EmailAgent(gateway, ToolRegistry(()))
+
+    result = await agent.run(_request(node_retry_max_attempts=3))
+
+    assert gateway.calls == 1
+    assert result.answer is None
+    assert result.model_turns == 1
+    assert result.termination_reason is AgentTerminationReason.NON_RETRYABLE_ERROR
+    assert len(result.node_events) == 1
+    assert result.node_events[0].node is AgentNodeName.MODEL
+    assert result.node_events[0].error_kind is AgentNodeErrorKind.NON_RETRYABLE
+    assert result.node_events[0].retryable is False
+    assert result.node_events[0].will_retry is False
+
+
+class TimeoutThenSuccessRegistry:
+    """Test double for an unexpected failure around the tool-registry boundary."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    @property
+    def definitions(self) -> tuple[ToolDefinition, ...]:
+        return ()
+
+    async def invoke(
+        self,
+        tool_name: str,
+        raw_arguments: dict[str, object],
+        context: ToolContext,
+    ) -> ToolInvocationResult:
+        self.calls += 1
+        if self.calls == 1:
+            raise TimeoutError("registry transport timed out")
+        return ToolInvocationResult(
+            tool_name=tool_name,
+            ok=True,
+            result={"items": []},
+        )
+
+
+async def test_agent_retries_a_transient_tool_node_failure() -> None:
+    gateway = ScriptedLLMGateway(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(id="call_search", name="search_mail", arguments={"query": "quote"})
+                ]
+            ),
+            LLMResponse(text="Recovered after tool retry"),
+        ]
+    )
+    registry = TimeoutThenSuccessRegistry()
+    agent = EmailAgent(gateway, registry)  # type: ignore[arg-type]
+
+    result = await agent.run(_request(node_retry_max_attempts=2))
+
+    assert registry.calls == 2
+    assert result.answer == "Recovered after tool retry"
+    assert result.termination_reason is AgentTerminationReason.COMPLETED
+    assert len(result.node_events) == 1
+    event = result.node_events[0]
+    assert event.node is AgentNodeName.TOOLS
+    assert event.attempt == 1
+    assert event.error_kind is AgentNodeErrorKind.TIMEOUT
+    assert event.retryable is True
+    assert event.will_retry is True
+    gateway.assert_exhausted()

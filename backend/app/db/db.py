@@ -10,15 +10,18 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     ARRAY,
+    JSON,
     BigInteger,
     Boolean,
     DateTime,
+    Index,
     Integer,
     MetaData,
     String,
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 
 
@@ -33,6 +36,11 @@ def _now_utc() -> datetime:
     """返回当前 UTC 时间，作为 fetched_at 的默认工厂。"""
     # 使用 UTC 时区，避免服务器本地时区差异导致的时间混乱
     return datetime.now(UTC)
+
+
+# Keep the ORM mapping compatible with lightweight SQLite tests while emitting
+# PostgreSQL JSONB, which is the documented production DDL, for the real DB.
+_STRUCTURED_JSON = JSON().with_variant(JSONB, "postgresql")
 
 
 class Account(Base):
@@ -249,3 +257,76 @@ class EmailMessage(Base):
             msg = "recipients must be list[str]"
             raise TypeError(msg)
         return value
+
+
+class EmailAnalysisRecord(Base):
+    """Durable, structured analysis for an archived top-level email.
+
+    This is intentionally separate from :class:`EmailMessage`: analyses can be
+    regenerated with a newer model or policy without changing the immutable
+    archived message.  The application-layer ``EmailAnalysis`` contract owns
+    validation and account-scope semantics; this class is only the ORM mapping.
+    """
+
+    __tablename__ = "email_analyses"
+    __table_args__ = (Index("email_analyses_account_email_idx", "account_id", "email_id"),)
+
+    analysis_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    email_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    intent: Mapped[str] = mapped_column(String(32), nullable=False)
+    urgency: Mapped[str] = mapped_column(String(32), nullable=False)
+    reply_required: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    key_points: Mapped[list[str]] = mapped_column(_STRUCTURED_JSON, nullable=False, default=list)
+    action_items: Mapped[list[str]] = mapped_column(_STRUCTURED_JSON, nullable=False, default=list)
+    analyzed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ReplyDraftVersionRecord(Base):
+    """One immutable version of a reply draft and its current review state.
+
+    ``draft_id`` stays stable across revisions while ``version`` monotonically
+    increases.  Keeping every version makes it possible to audit what was
+    reviewed without an unsafe in-place update to the draft contents.
+    """
+
+    __tablename__ = "reply_draft_versions"
+    __table_args__ = (
+        Index("reply_draft_versions_account_draft_idx", "account_id", "draft_id"),
+        Index("reply_draft_versions_email_idx", "email_id"),
+    )
+
+    draft_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    analysis_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    recipients: Mapped[list[str]] = mapped_column(_STRUCTURED_JSON, nullable=False)
+    subject: Mapped[str] = mapped_column(String(1_000), nullable=False)
+    body_text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    reviewed_by: Mapped[str | None] = mapped_column(String(128))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_comment: Mapped[str | None] = mapped_column(Text)
+
+
+class ReplyDraftTransitionRecord(Base):
+    """Append-only audit row accompanying exactly one draft version write."""
+
+    __tablename__ = "reply_draft_transitions"
+    __table_args__ = (Index("reply_draft_transitions_draft_idx", "draft_id", "to_version"),)
+
+    draft_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    to_version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    from_version: Mapped[int | None] = mapped_column(Integer)
+    from_status: Mapped[str | None] = mapped_column(String(32))
+    to_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    comment: Mapped[str | None] = mapped_column(Text)

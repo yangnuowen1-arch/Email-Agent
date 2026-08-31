@@ -113,12 +113,16 @@ than accepting it from an untrusted request.
 Each run has a generated `run_id`, a bounded number of model turns, a bounded
 number of tool calls per model turn, a model-response timeout, an ordered tool
 event trail (tool name, call ID, success, duration, and error code), and a
-stable terminal reason.  The graph does not install a persistent checkpointer
-yet: its state can contain authorized email context and must not be silently
-persisted without an explicit retention, encryption, and access-control design.
-The existing `ToolRegistry` remains responsible for individual-tool timeouts;
-the graph treats timeout and all other tool failures as observations and gives
-the model a chance to recover or answer honestly.
+stable terminal reason.  Model and tool nodes also use a bounded retry policy:
+only a typed `TransientLLMError` or a local timeout is retried. Authentication,
+invalid output, and unexpected errors become a non-retryable terminal result.
+Safe node events record the node, attempt, error category, and retry decision
+without exposing provider exception text. A normal tool business failure still
+remains a structured observation rather than a graph retry.
+
+The graph does not install a persistent checkpointer yet: its state can contain
+authorized email context and must not be silently persisted without an explicit
+retention, encryption, and access-control design.
 
 ## Inbound sync contract
 
@@ -155,22 +159,37 @@ checkpoint advancement for that account.  Successfully parsed messages may
 still be stored; a later retry is safe because `(account_id, uid)` is unique.
 This trades an inexpensive duplicate read for avoiding permanent mail loss.
 
-## Future capabilities
+## Analysis, reply draft, and human review
 
-The next phases remain separate from syncing:
+The workflow below is implemented as application services and remains separate
+from syncing:
 
 ```text
 stored mail --> analysis service --> reply-draft service --> pending approval
                                                                |
-human approval ------------------------------------------------+
-                                                               v
-                                                    send-approved-draft --> SMTP
+human approval ------------------------------------------------+--> approved
+                                                                    |
+                                                                    v
+                                               future send-approved-draft --> SMTP
 ```
 
-The LLM may produce only typed analysis and draft proposals.  It may not mark a
-draft approved or send mail.  Approval will be a persisted, versioned state
-machine, and the SMTP adapter will be reachable only from an
-`SendApprovedDraft` use case after a fresh approval check.
+The LLM may produce only typed analysis and draft proposals. It may not attach
+trusted IDs, widen account scope, mark a draft approved, or send mail. The
+services persist analyses independently and append a new immutable draft
+version plus a matching audit transition for every create, revision, submit,
+approval, rejection, or withdrawal. The review state machine is:
+
+```text
+draft → pending_review → approved
+                       └→ rejected → revised draft
+pending_review → withdrawn draft
+```
+
+Each write uses the caller's expected version, so a concurrent edit fails with
+a typed version conflict instead of overwriting an approved review. `approved`
+is a business state only: there is still no SMTP adapter or send use case. A
+future `SendApprovedDraft` use case must recheck the current approved version
+inside its own transaction before it can reach SMTP.
 
 ## Testing boundary
 
@@ -180,6 +199,11 @@ machine, and the SMTP adapter will be reachable only from an
 - mail-tool tests use a fake query service to cover schema validation, account
   scope, not-found/error observations, and registry timeouts;
 - LLM and agent tests use a scripted fake gateway to cover no-tool paths,
-  model-to-tool-to-model transcript replay, structured failures, and the
-  maximum-turn, tool-call-limit, and model-timeout terminal states;
-- future SMTP tests prove that an unapproved draft cannot trigger a send.
+  model-to-tool-to-model transcript replay, typed transient retries, timeout
+  exhaustion, non-retryable failures, and the maximum-turn/tool-call limits;
+- workflow tests use fake analyzer, generator, and stores to cover account
+  scope, typed analyses, immutable draft revisions, human approval transitions,
+  and optimistic-concurrency conflicts; SQLAlchemy tests verify that a version
+  and its audit transition commit together;
+- a future SMTP test suite must prove that an unapproved or stale draft cannot
+  trigger a send.

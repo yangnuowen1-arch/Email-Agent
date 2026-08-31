@@ -181,7 +181,11 @@ class LLMGateway(Protocol):
     """Contract for providers that can receive tool definitions and tool calls."""
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
-        """Return text and/or validated tool-call requests for one model turn."""
+        """Return one model turn or raise a typed provider-boundary failure.
+
+        Provider adapters use :class:`TransientLLMError` only when retrying the
+        same request may succeed, and :class:`NonRetryableLLMError` otherwise.
+        """
 
 
 class EchoLLMClient:
